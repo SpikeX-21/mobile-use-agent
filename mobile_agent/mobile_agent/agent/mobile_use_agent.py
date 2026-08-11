@@ -95,6 +95,9 @@ class MobileUseAgent:
             self.logger.set_context(thread_id=session_id, chat_thread_id=thread_id)
             self.task_id = task_id
             self.stream = is_stream
+            prepare_task = getattr(self.device_backend, "prepare_task", None)
+            if callable(prepare_task):
+                await prepare_task(query)
             initial_state = {
                 "user_prompt": query,
                 "iteration_count": 0,

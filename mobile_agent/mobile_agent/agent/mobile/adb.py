@@ -9,6 +9,7 @@ import base64
 import io
 import os
 import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -16,9 +17,11 @@ from PIL import Image, UnidentifiedImageError
 
 from mobile_agent.agent.actions import (
     CanonicalAction,
+    ClearTextAction,
     FailAction,
     FinishAction,
     TapAction,
+    TextInputAction,
     WaitAction,
 )
 from mobile_agent.agent.infra.model import ToolCall
@@ -102,7 +105,10 @@ class SubprocessAdbRunner:
             ) from exc
         result = AdbCommandResult(stdout, stderr, process.returncode or 0)
         if result.returncode != 0:
-            detail = result.stderr.decode("utf-8", errors="replace").strip()
+            detail = (
+                result.stderr.decode("utf-8", errors="replace").strip()
+                or result.stdout.decode("utf-8", errors="replace").strip()
+            )
             raise AdbCommandError(
                 f"ADB command failed: {detail or 'unknown error'}",
                 kind=classify_device_error(detail),
@@ -122,6 +128,7 @@ class AdbDeviceBackend:
     def __init__(self, config: AdbConfig, runner: AdbRunner | None = None):
         self.config = config
         self._runner = runner or SubprocessAdbRunner(config)
+        self._current_user_prompt = ""
 
     async def initialize(self, **connection: str) -> None:
         result = await self._runner.run("-s", self.config.serial, "get-state")
@@ -130,6 +137,25 @@ class AdbDeviceBackend:
                 "Configured ADB target is not in device state",
                 kind=DeviceErrorKind.OFFLINE,
             )
+
+    async def prepare_task(self, user_prompt: str) -> None:
+        self._current_user_prompt = user_prompt
+        await self._runner.run(
+            "-s",
+            self.config.serial,
+            "shell",
+            "am",
+            "force-stop",
+            self.config.oracle_package,
+        )
+        await self._runner.run(
+            "-s",
+            self.config.serial,
+            "shell",
+            "input",
+            "keyevent",
+            "KEYCODE_HOME",
+        )
 
     async def take_screenshot(self) -> dict[str, object]:
         final_error: AdbCommandError | None = None
@@ -181,6 +207,13 @@ class AdbDeviceBackend:
                     "y": _to_pixel(action.y, height),
                 },
             }
+        if isinstance(action, TextInputAction):
+            return {
+                "name": "mobile:text_input",
+                "arguments": {"text": action.text},
+            }
+        if isinstance(action, ClearTextAction):
+            return {"name": "mobile:clear_text", "arguments": {}}
         if isinstance(action, WaitAction):
             return {"name": "wait", "arguments": {"t": action.duration_ms / 1000}}
         if isinstance(action, FinishAction):
@@ -198,23 +231,84 @@ class AdbDeviceBackend:
     ) -> ActionResult:
         tool_call = self.to_tool_call(action, screenshot_dimensions)
         arguments = tool_call["arguments"]
+        if isinstance(action, WaitAction):
+            await asyncio.sleep(action.duration_ms / 1000)
+            return ActionResult.success(
+                f"Waited {action.duration_ms / 1000:g}s for the UI to settle"
+            )
         try:
+            if isinstance(action, TapAction):
+                await self._runner.run(
+                    "-s",
+                    self.config.serial,
+                    "shell",
+                    "input",
+                    "tap",
+                    str(arguments["x"]),
+                    str(arguments["y"]),
+                )
+            elif isinstance(action, TextInputAction):
+                await self._input_text(action.text)
+            elif isinstance(action, ClearTextAction):
+                await self._runner.run(
+                    "-s",
+                    self.config.serial,
+                    "shell",
+                    "input",
+                    "keycombination",
+                    "113",
+                    "29",
+                )
+                await self._runner.run(
+                    "-s",
+                    self.config.serial,
+                    "shell",
+                    "input",
+                    "keyevent",
+                    "KEYCODE_DEL",
+                )
+            else:
+                raise NotImplementedError(
+                    f"ADB backend cannot execute {type(action).__name__}"
+                )
+        except AdbCommandError as exc:
+            if exc.kind is DeviceErrorKind.TIMEOUT:
+                return ActionResult.ambiguous(
+                    f"ADB {action.type} result is unknown after timeout", exc.kind
+                )
+            return ActionResult.failed(str(exc), exc.kind)
+        return ActionResult.success(f"ADB {action.type} dispatched")
+
+    async def _input_text(self, text: str) -> None:
+        if re.fullmatch(r"[A-Za-z0-9._@+\-]+", text):
             await self._runner.run(
                 "-s",
                 self.config.serial,
                 "shell",
                 "input",
-                "tap",
-                str(arguments["x"]),
-                str(arguments["y"]),
+                "text",
+                text,
             )
-        except AdbCommandError as exc:
-            if exc.kind is DeviceErrorKind.TIMEOUT:
-                return ActionResult.ambiguous(
-                    "ADB tap result is unknown after timeout", exc.kind
-                )
-            return ActionResult.failed(str(exc), exc.kind)
-        return ActionResult.success("ADB tap dispatched")
+            return
+
+        encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
+        clipboard_command = (
+            f'cmd clipboard set "$(echo {encoded} | base64 -d)"'
+        )
+        await self._runner.run(
+            "-s",
+            self.config.serial,
+            "shell",
+            clipboard_command,
+        )
+        await self._runner.run(
+            "-s",
+            self.config.serial,
+            "shell",
+            "input",
+            "keyevent",
+            "KEYCODE_PASTE",
+        )
 
     async def close(self) -> None:
         return None
@@ -222,8 +316,14 @@ class AdbDeviceBackend:
     async def verify_completion(self, action: CanonicalAction) -> bool | None:
         if not isinstance(action, FinishAction):
             return None
-        oracle = AdbForegroundAppOracle(self.config, runner=self._runner)
-        return await oracle.is_foreground()
+        required_text = (
+            "上海外滩" if "上海外滩" in self._current_user_prompt else None
+        )
+        oracle = AdbTaskOracle(self.config, runner=self._runner)
+        try:
+            return await oracle.is_complete(required_text=required_text)
+        except AdbCommandError:
+            return False
 
 
 class AdbForegroundAppOracle:
@@ -250,3 +350,44 @@ class AdbForegroundAppOracle:
             if component is not None:
                 return component.group(1) == expected
         return False
+
+
+class AdbTaskOracle:
+    """Checks task completion using Android state rather than model claims."""
+
+    def __init__(self, config: AdbConfig, runner: AdbRunner | None = None):
+        self._config = config
+        self._runner = runner or SubprocessAdbRunner(config)
+
+    async def is_complete(self, required_text: str | None = None) -> bool:
+        foreground_oracle = AdbForegroundAppOracle(
+            self._config, runner=self._runner
+        )
+        if not await foreground_oracle.is_foreground():
+            return False
+        if required_text is None:
+            return True
+
+        result = await self._runner.run(
+            "-s",
+            self._config.serial,
+            "exec-out",
+            "uiautomator",
+            "dump",
+            "/dev/tty",
+        )
+        output = result.stdout.decode("utf-8", errors="replace")
+        hierarchy_end = output.find("</hierarchy>")
+        if hierarchy_end < 0:
+            return False
+        xml_document = output[: hierarchy_end + len("</hierarchy>")]
+        try:
+            hierarchy = ET.fromstring(xml_document)
+        except ET.ParseError:
+            return False
+        return any(
+            required_text in node.attrib.get(attribute, "")
+            for node in hierarchy.iter()
+            if node.attrib.get("visible-to-user", "true").lower() != "false"
+            for attribute in ("text", "content-desc")
+        )

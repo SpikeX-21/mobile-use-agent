@@ -33,12 +33,16 @@ class FakeDeviceBackend:
     def __init__(self):
         self.connection = None
         self.closed = False
+        self.prepared_tasks = []
 
     async def initialize(self, **connection):
         self.connection = connection
 
     async def close(self):
         self.closed = True
+
+    async def prepare_task(self, user_prompt):
+        self.prepared_tasks.append(user_prompt)
 
 
 class RecordingGraph:
@@ -191,6 +195,7 @@ class AgentRuntimeSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(graph.context["model"], model)
         self.assertIs(graph.context["device"], device)
         self.assertFalse(agent_object_manager.has_context("chat-1"))
+        self.assertEqual(device.prepared_tasks, ["打开高德地图"])
         self.assertEqual(
             device.connection,
             {
@@ -295,7 +300,8 @@ class AgentRuntimeSelectionTests(unittest.IsolatedAsyncioTestCase):
             and isinstance(chunk[1], str)
         )
 
-        self.assertEqual(backend.executed, [])
+        self.assertEqual(len(backend.executed), 1)
+        self.assertEqual(backend.executed[0][0], WaitAction(duration_ms=1))
         self.assertIn('"tool_name": "wait"', custom_output)
         self.assertIn('"type": "user_interrupt"', custom_output)
         self.assertIn('"content": "请登录"', custom_output)
@@ -335,7 +341,7 @@ class AgentRuntimeSelectionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(provider.calls, 2)
         self.assertEqual(backend.oracle_calls, 2)
-        self.assertIn("ADB 前台应用连续两次未满足完成条件", custom_output)
+        self.assertIn("ADB 独立 Oracle 连续两次未满足完成条件", custom_output)
 
 
 if __name__ == "__main__":

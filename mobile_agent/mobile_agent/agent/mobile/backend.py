@@ -11,9 +11,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Protocol
 
-from mobile_agent.agent.actions import CanonicalAction, ListAppsAction
+from mobile_agent.agent.actions import CanonicalAction, ListAppsAction, WaitAction
 from mobile_agent.agent.actions.mcp_adapter import canonical_action_to_mcp_tool_call
 from mobile_agent.agent.infra.model import ToolCall
 from mobile_agent.agent.mobile.client import Mobile
@@ -37,6 +38,8 @@ class DeviceBackend(Protocol):
     async def initialize(self, **connection: str) -> None: ...
 
     async def take_screenshot(self) -> dict[str, Any]: ...
+
+    async def prepare_task(self, user_prompt: str) -> None: ...
 
     async def execute(
         self,
@@ -84,6 +87,9 @@ class McpDeviceBackend:
         kind = classify_device_error(final_error)
         raise DeviceBackendError(str(final_error), kind=kind) from final_error
 
+    async def prepare_task(self, user_prompt: str) -> None:
+        return None
+
     async def execute(
         self,
         action: CanonicalAction,
@@ -91,6 +97,11 @@ class McpDeviceBackend:
     ) -> ActionResult:
         if self._tools is None:
             raise RuntimeError("MCP device backend is not initialized")
+        if isinstance(action, WaitAction):
+            await asyncio.sleep(action.duration_ms / 1000)
+            return ActionResult.success(
+                f"Waited {action.duration_ms / 1000:g}s for the UI to settle"
+            )
         tool_call = self.to_tool_call(action, screenshot_dimensions)
         attempts = 2 if isinstance(action, ListAppsAction) else 1
         for attempt in range(attempts):

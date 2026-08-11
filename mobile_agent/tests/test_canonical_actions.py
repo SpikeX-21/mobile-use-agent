@@ -99,6 +99,10 @@ class CanonicalActionTests(unittest.TestCase):
                 with self.assertRaises(ValidationError):
                     validate_canonical_action(action)
 
+    def test_rejects_empty_text_input(self):
+        with self.assertRaises(ValidationError):
+            validate_canonical_action({"type": "text_input", "text": ""})
+
 
 if __name__ == "__main__":
     unittest.main()
