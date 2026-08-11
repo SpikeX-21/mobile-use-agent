@@ -30,8 +30,47 @@ from mobile_agent.agent.graph.state import MobileUseAgentState
 import uuid
 from langgraph.config import get_stream_writer
 from mobile_agent.agent.graph.context import agent_object_manager
+from mobile_agent.agent.mobile.result import (
+    ActionResult,
+    ActionResultStatus,
+    DeviceBackendError,
+    DeviceErrorKind,
+    classify_device_error,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _retry_would_exceed_step_limit(state: MobileUseAgentState) -> bool:
+    return state.get("iteration_count", 0) >= state.get("max_iterations", 10)
+
+
+def _set_terminal_failure(
+    state: MobileUseAgentState, reason: str, device_backend=None
+) -> None:
+    failure = FailAction(reason=reason)
+    if device_backend is not None:
+        try:
+            tool_call = device_backend.to_tool_call(
+                failure, state.get("screenshot_dimensions") or (1, 1)
+            )
+        except Exception:
+            tool_call = {"name": "call_user", "arguments": {"content": reason}}
+    else:
+        tool_call = {"name": "call_user", "arguments": {"content": reason}}
+    state.update(action=failure, tool_call=tool_call, terminal_reason=reason)
+    get_stream_writer()(
+        format_sse(
+            UserInterruptMessageData(
+                id=state.get("chunk_id") or str(uuid.uuid4()),
+                task_id=state.get("task_id"),
+                role="assistant",
+                type="user_interrupt",
+                interrupt_type="text",
+                content=reason,
+            )
+        )
+    )
 
 
 async def prepare_node(state: MobileUseAgentState):
@@ -72,7 +111,12 @@ async def model_node(state: MobileUseAgentState) -> MobileUseAgentState:
     iteration_count = state.get("iteration_count")
 
     # 获取截图
-    screenshot_state = await device_backend.take_screenshot()
+    try:
+        screenshot_state = await device_backend.take_screenshot()
+    except DeviceBackendError as exc:
+        label = "设备离线" if exc.kind is DeviceErrorKind.OFFLINE else "设备观察失败"
+        state.update(terminal_reason=f"{label}：{exc}")
+        return state
     state.update(screenshot=screenshot_state.get("screenshot"))
     state.update(screenshot_dimensions=screenshot_state.get("screenshot_dimensions"))
 
@@ -128,11 +172,28 @@ async def tool_valid_node(state: MobileUseAgentState) -> MobileUseAgentState:
     tool_call_str = state.get("tool_call_str")
     model_provider = agent_object_manager.get_model_provider(state.get("thread_id"))
     device_backend = agent_object_manager.get_device_backend(state.get("thread_id"))
+    if state.get("terminal_reason"):
+        _set_terminal_failure(state, state.get("terminal_reason"), device_backend)
+        return state
     try:
         action = model_provider.parse_action(tool_call_str)
     except ActionParseError:
+        schema_error_count = state.get("schema_error_count", 0) + 1
+        if schema_error_count >= 3:
+            state.update(schema_error_count=schema_error_count)
+            _set_terminal_failure(
+                state, "模型动作连续 3 次未通过 Schema 校验", device_backend
+            )
+            return state
+        if _retry_would_exceed_step_limit(state):
+            state.update(schema_error_count=schema_error_count)
+            _set_terminal_failure(
+                state, "任务达到 10 步上限，已安全终止", device_backend
+            )
+            return state
         state.update(
             action=None,
+            schema_error_count=schema_error_count,
             tool_call={"name": "error_action", "arguments": {"content": tool_call_str}},
             tool_output={
                 "result": "模型输出解析失败，请尝试重新按照正确的格式生成"
@@ -152,7 +213,7 @@ async def tool_valid_node(state: MobileUseAgentState) -> MobileUseAgentState:
         )
         return state
 
-
+    state.update(schema_error_count=0)
     verify_completion = getattr(device_backend, "verify_completion", None)
     if isinstance(action, FinishAction) and callable(verify_completion):
         if await verify_completion(action) is False:
@@ -161,6 +222,12 @@ async def tool_valid_node(state: MobileUseAgentState) -> MobileUseAgentState:
                 action = FailAction(reason="ADB 前台应用连续两次未满足完成条件")
                 state.update(oracle_failure_count=oracle_failure_count)
             else:
+                if _retry_would_exceed_step_limit(state):
+                    state.update(oracle_failure_count=oracle_failure_count)
+                    _set_terminal_failure(
+                        state, "任务达到 10 步上限，已安全终止", device_backend
+                    )
+                    return state
                 state.update(
                     action=None,
                     oracle_failure_count=oracle_failure_count,
@@ -181,6 +248,11 @@ async def tool_valid_node(state: MobileUseAgentState) -> MobileUseAgentState:
             action, state.get("screenshot_dimensions")
         )
     except (NotImplementedError, TypeError, ValueError) as exc:
+        if _retry_would_exceed_step_limit(state):
+            _set_terminal_failure(
+                state, "任务达到 10 步上限，已安全终止", device_backend
+            )
+            return state
         state.update(
             action=None,
             tool_call={
@@ -241,35 +313,57 @@ async def tool_node(state: MobileUseAgentState) -> MobileUseAgentState:
     sse_writer(get_writer_tool_input(state, tool_call))
 
     logger.info(f"tool_call========: {tool_call}")
-    # 检查特殊工具
+    action_result: ActionResult
+    device_backend = agent_object_manager.get_device_backend(state.get("thread_id"))
     try:
         if isinstance(action, WaitAction):
             await asyncio.sleep(action.duration_ms / 1000)
-            result = f"已等待{action.duration_ms / 1000:g}s"
-        else:
-            device_backend = agent_object_manager.get_device_backend(
-                state.get("thread_id")
+            action_result = ActionResult.success(
+                f"已等待{action.duration_ms / 1000:g}s"
             )
-            result = await device_backend.execute(
+        else:
+            raw_result = await device_backend.execute(
                 action, state.get("screenshot_dimensions")
             )
-        output = {
-            "result": f"{tool_call['name']}:({tool_call['arguments']})\n{result}\n操作下发成功"
-        }
-        state.update(tool_output=output)
-        # 等待操作完成
-        await asyncio.sleep(state.get("step_interval"))
+            action_result = (
+                raw_result
+                if isinstance(raw_result, ActionResult)
+                else ActionResult.success(str(raw_result))
+            )
+    except TimeoutError:
+        action_result = ActionResult.ambiguous(
+            "设备动作超时，结果不确定", DeviceErrorKind.TIMEOUT
+        )
+    except Exception as exc:
+        logger.error(f"tool_call_client.call error: {exc}")
+        error_kind = classify_device_error(exc)
+        action_result = ActionResult.failed(str(exc), error_kind)
 
-    except Exception as e:
-        logger.error(f"tool_call_client.call error: {e}")
-        output = {"result": f"Error: {str(e)}"}
-        sse_writer((get_writer_tool_output(state, tool_call, output, status="stop")))
-        state.update(tool_output=output)
+    output = {
+        "status": action_result.status.value,
+        "error_kind": (
+            action_result.error_kind.value if action_result.error_kind else None
+        ),
+        "result": action_result.message,
+    }
+    state.update(tool_output=output)
+
+    if action_result.status is ActionResultStatus.SUCCESS:
+        await asyncio.sleep(state.get("step_interval"))
+        sse_writer(get_writer_tool_output(state, tool_call, output, status="success"))
+    else:
+        sse_writer(get_writer_tool_output(state, tool_call, output, status="stop"))
+
+    if action_result.error_kind is DeviceErrorKind.OFFLINE:
+        _set_terminal_failure(
+            state, f"设备离线：{action_result.message}", device_backend
+        )
+    elif state.get("iteration_count", 0) >= state.get("max_iterations", 10):
+        _set_terminal_failure(
+            state, "任务达到 10 步上限，已安全终止", device_backend
+        )
 
     logger.info(f"tool_output========: {state.get('tool_output')}")
-
-    # 写工具 output
-    sse_writer(get_writer_tool_output(state, tool_call, output, status="success"))
 
     return state
 
@@ -299,7 +393,10 @@ async def should_react_continue(state: MobileUseAgentState) -> str:
         "max_iterations",
     )
 
-    if iteration_count >= max_iterations:
+    if (
+        isinstance(state.get("action"), FailAction)
+        or iteration_count >= max_iterations
+    ):
         return "finish"
 
     # 否则继续执行

@@ -111,6 +111,13 @@ python main.py
 执行前会按截图尺寸转换为像素。高德地图验收可用
 `adb shell dumpsys window` 独立确认前台包是否为 `com.autonavi.minimap`。
 
+动作执行结果统一分为 `success`、`failed` 和 `ambiguous`。点击、滑动、输入、
+按键及应用生命周期操作发生超时时不会自动重放，而是标记为 `ambiguous`，
+下一轮先获取新截图，再由 Agent 判断动作是否已经生效。截图和应用列表读取最多
+尝试两次；设备离线、连续三次动作 Schema 错误或达到十步上限时会给出明确原因并
+终止。每个工具调用只会产生一个最终 SSE 状态，不会在 `stop` 后再次发送
+`success`。
+
 ## 🛠️ 核心组件
 
 通过 Mobile Use MCP 支持的移动设备操作：

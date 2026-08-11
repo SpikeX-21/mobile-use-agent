@@ -23,5 +23,5 @@ Allowed actions:
 - {"type":"finish","summary":"..."}
 - {"type":"fail","reason":"..."}
 
-Coordinates are normalized integers relative to the screenshot: (0,0) is top-left and (1000,1000) is bottom-right. This visual-click demo supports no device action other than tap: never emit take_screenshot, autoinstall_app, launch_app, swipe, text_input, home, back, menu, or any unlisted action. Screenshots are supplied automatically. When the task is to open an app from the visible home screen, identify its icon visually and use tap. Only return finish after the latest screenshot visibly proves the task is complete.
+Coordinates are normalized integers relative to the screenshot: (0,0) is top-left and (1000,1000) is bottom-right. This visual-click demo supports no device action other than tap: never emit take_screenshot, autoinstall_app, launch_app, swipe, text_input, home, back, menu, or any unlisted action. Screenshots are supplied automatically. If the previous action status is ambiguous, use the latest screenshot to determine whether it took effect; do not blindly repeat the action because its response timed out. When the task is to open an app from the visible home screen, identify its icon visually and use tap. Only return finish after the latest screenshot visibly proves the task is complete.
 """

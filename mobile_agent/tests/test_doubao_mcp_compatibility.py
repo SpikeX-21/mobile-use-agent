@@ -33,6 +33,12 @@ from mobile_agent.agent.actions.mcp_adapter import (
 )
 from mobile_agent.agent.llm.provider import ActionParseError, DoubaoModelProvider
 from mobile_agent.agent.mobile.backend import McpDeviceBackend
+from mobile_agent.agent.mobile.result import (
+    ActionResult,
+    ActionResultStatus,
+    DeviceBackendError,
+    DeviceErrorKind,
+)
 
 
 class RecordingTools:
@@ -60,7 +66,7 @@ class DoubaoMcpCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         result = await backend.execute(action, screenshot_dimensions=(1080, 2278))
 
         self.assertEqual(action, TapAction(x=500, y=500))
-        self.assertEqual(result, "ok")
+        self.assertEqual(result, ActionResult.success("ok"))
         self.assertEqual(
             tools.calls,
             [
@@ -70,6 +76,114 @@ class DoubaoMcpCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                 }
             ],
         )
+
+    async def test_side_effect_timeouts_are_ambiguous_and_never_auto_replayed(self):
+        class TimingOutTools:
+            def __init__(self):
+                self.calls = 0
+
+            async def exec(self, tool_call):
+                self.calls += 1
+                raise TimeoutError("lost response")
+
+        side_effects = [
+            TapAction(x=500, y=500),
+            SwipeAction(start_x=100, start_y=100, end_x=900, end_y=900),
+            TextInputAction(text="上海外滩"),
+            ClearTextAction(),
+            HomeAction(),
+            BackAction(),
+            MenuAction(),
+            LaunchAppAction(package_name="com.autonavi.minimap"),
+            CloseAppAction(package_name="com.autonavi.minimap"),
+        ]
+
+        for action in side_effects:
+            with self.subTest(action=action.type):
+                tools = TimingOutTools()
+                result = await McpDeviceBackend(tools=tools).execute(
+                    action, screenshot_dimensions=(1080, 2278)
+                )
+                self.assertEqual(result.status, ActionResultStatus.AMBIGUOUS)
+                self.assertEqual(result.error_kind, DeviceErrorKind.TIMEOUT)
+                self.assertEqual(tools.calls, 1)
+
+    async def test_list_apps_timeout_has_one_bounded_retry_and_is_not_ambiguous(self):
+        class TimingOutTools:
+            def __init__(self):
+                self.calls = 0
+
+            async def exec(self, tool_call):
+                self.calls += 1
+                raise TimeoutError("read timeout")
+
+        tools = TimingOutTools()
+
+        result = await McpDeviceBackend(tools=tools).execute(
+            ListAppsAction(), screenshot_dimensions=(1080, 2278)
+        )
+
+        self.assertEqual(result.status, ActionResultStatus.FAILED)
+        self.assertEqual(result.error_kind, DeviceErrorKind.TIMEOUT)
+        self.assertEqual(tools.calls, 2)
+
+    async def test_mcp_screenshot_has_one_bounded_retry_and_classified_failure(self):
+        class OfflineMobile:
+            def __init__(self):
+                self.calls = 0
+
+            async def take_screenshot(self):
+                self.calls += 1
+                raise RuntimeError("device offline")
+
+        mobile = OfflineMobile()
+        backend = McpDeviceBackend(tools=object(), mobile=mobile)
+
+        with self.assertRaises(DeviceBackendError) as raised:
+            await backend.take_screenshot()
+
+        self.assertEqual(mobile.calls, 2)
+        self.assertEqual(raised.exception.kind, DeviceErrorKind.OFFLINE)
+
+    async def test_mcp_screenshot_timeout_preserves_timeout_classification(self):
+        class TimingOutMobile:
+            def __init__(self):
+                self.calls = 0
+
+            async def take_screenshot(self):
+                self.calls += 1
+                raise TimeoutError("screenshot timed out")
+
+        mobile = TimingOutMobile()
+        backend = McpDeviceBackend(tools=object(), mobile=mobile)
+
+        with self.assertRaises(DeviceBackendError) as raised:
+            await backend.take_screenshot()
+
+        self.assertEqual(mobile.calls, 2)
+        self.assertEqual(raised.exception.kind, DeviceErrorKind.TIMEOUT)
+
+    async def test_typed_mcp_deadline_error_is_ambiguous_for_side_effect(self):
+        class DeadlineTools:
+            def __init__(self):
+                self.calls = 0
+
+            async def exec(self, tool_call):
+                self.calls += 1
+                raise DeviceBackendError(
+                    "rpc error: code = DeadlineExceeded",
+                    kind=DeviceErrorKind.TIMEOUT,
+                )
+
+        tools = DeadlineTools()
+
+        result = await McpDeviceBackend(tools=tools).execute(
+            TapAction(x=500, y=500), screenshot_dimensions=(1080, 2278)
+        )
+
+        self.assertEqual(result.status, ActionResultStatus.AMBIGUOUS)
+        self.assertEqual(result.error_kind, DeviceErrorKind.TIMEOUT)
+        self.assertEqual(tools.calls, 1)
 
     def test_terminal_doubao_actions_use_canonical_vocabulary(self):
         self.assertEqual(

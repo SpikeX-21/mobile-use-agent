@@ -56,6 +56,11 @@ class RecordingClient:
 
 
 class KimiModelProviderTests(unittest.IsolatedAsyncioTestCase):
+    def test_prompt_requires_observation_before_deciding_after_ambiguous_result(self):
+        self.assertIn("ambiguous", KimiModelProvider.prompt)
+        self.assertIn("latest screenshot", KimiModelProvider.prompt)
+        self.assertIn("do not blindly repeat", KimiModelProvider.prompt)
+
     def test_thinking_mode_cannot_be_enabled(self):
         with self.assertRaises(ValidationError):
             KimiConfig(api_key=SecretStr("unit-test-key"), thinking_mode="enabled")

@@ -22,6 +22,7 @@ from mobile_agent.agent.mobile.adb import (
     AdbForegroundAppOracle,
     SubprocessAdbRunner,
 )
+from mobile_agent.agent.mobile.result import ActionResultStatus, DeviceErrorKind
 from mobile_agent.config.settings import AdbConfig
 
 
@@ -61,11 +62,57 @@ class AdbDeviceBackendTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_invalid_screenshot_bytes_are_rejected(self):
-        runner = RecordingRunner([AdbCommandResult(stdout=b"not-an-image")])
+        runner = RecordingRunner(
+            [
+                AdbCommandResult(stdout=b"not-an-image"),
+                AdbCommandResult(stdout=b"still-not-an-image"),
+            ]
+        )
         backend = AdbDeviceBackend(self.make_config(), runner=runner)
 
         with self.assertRaisesRegex(AdbCommandError, "valid image"):
             await backend.take_screenshot()
+
+    async def test_screenshot_retries_once_then_returns_valid_observation(self):
+        class FlakyObservationRunner:
+            def __init__(self):
+                self.calls = 0
+
+            async def run(self, *arguments):
+                self.calls += 1
+                if self.calls == 1:
+                    raise AdbCommandError(
+                        "transient timeout", kind=DeviceErrorKind.TIMEOUT
+                    )
+                return AdbCommandResult(stdout=png_bytes())
+
+        runner = FlakyObservationRunner()
+        backend = AdbDeviceBackend(self.make_config(), runner=runner)
+
+        result = await backend.take_screenshot()
+
+        self.assertEqual(result["screenshot_dimensions"], (1080, 2400))
+        self.assertEqual(runner.calls, 2)
+
+    async def test_screenshot_exhaustion_preserves_final_error_classification(self):
+        class OfflineRunner:
+            def __init__(self):
+                self.calls = 0
+
+            async def run(self, *arguments):
+                self.calls += 1
+                raise AdbCommandError(
+                    "device offline", kind=DeviceErrorKind.OFFLINE
+                )
+
+        runner = OfflineRunner()
+        backend = AdbDeviceBackend(self.make_config(), runner=runner)
+
+        with self.assertRaises(AdbCommandError) as raised:
+            await backend.take_screenshot()
+
+        self.assertEqual(raised.exception.kind, DeviceErrorKind.OFFLINE)
+        self.assertEqual(runner.calls, 2)
 
     async def test_tap_converts_normalized_coordinates_and_clips_edges(self):
         runner = RecordingRunner([AdbCommandResult(stdout=b"")])
@@ -83,6 +130,26 @@ class AdbDeviceBackendTests(unittest.IsolatedAsyncioTestCase):
             runner.calls,
             [("-s", "device-1", "shell", "input", "tap", "1079", "1200")],
         )
+
+    async def test_side_effect_timeout_is_ambiguous_and_is_not_replayed(self):
+        class TimingOutRunner:
+            def __init__(self):
+                self.calls = []
+
+            async def run(self, *arguments):
+                self.calls.append(arguments)
+                raise AdbCommandError(
+                    "ADB command timed out", kind=DeviceErrorKind.TIMEOUT
+                )
+
+        runner = TimingOutRunner()
+        backend = AdbDeviceBackend(self.make_config(), runner=runner)
+
+        result = await backend.execute(TapAction(x=500, y=500), (1080, 2400))
+
+        self.assertEqual(result.status, ActionResultStatus.AMBIGUOUS)
+        self.assertEqual(result.error_kind, DeviceErrorKind.TIMEOUT)
+        self.assertEqual(len(runner.calls), 1)
 
     async def test_foreground_oracle_uses_adb_state_not_model_output(self):
         runner = RecordingRunner(

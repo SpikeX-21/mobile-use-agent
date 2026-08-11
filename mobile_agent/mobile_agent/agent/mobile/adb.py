@@ -22,11 +22,20 @@ from mobile_agent.agent.actions import (
     WaitAction,
 )
 from mobile_agent.agent.infra.model import ToolCall
+from mobile_agent.agent.mobile.result import (
+    ActionResult,
+    DeviceBackendError,
+    DeviceErrorKind,
+    classify_device_error,
+)
 from mobile_agent.config.settings import AdbConfig
 
 
-class AdbCommandError(RuntimeError):
+class AdbCommandError(DeviceBackendError):
     """An ADB command failed without exposing its environment."""
+
+    def __init__(self, message: str, *, kind: DeviceErrorKind):
+        super().__init__(message, kind=kind)
 
 
 @dataclass(frozen=True)
@@ -88,11 +97,16 @@ class SubprocessAdbRunner:
             await asyncio.shield(process.wait())
             if isinstance(exc, asyncio.CancelledError):
                 raise
-            raise AdbCommandError("ADB command timed out") from exc
+            raise AdbCommandError(
+                "ADB command timed out", kind=DeviceErrorKind.TIMEOUT
+            ) from exc
         result = AdbCommandResult(stdout, stderr, process.returncode or 0)
         if result.returncode != 0:
             detail = result.stderr.decode("utf-8", errors="replace").strip()
-            raise AdbCommandError(f"ADB command failed: {detail or 'unknown error'}")
+            raise AdbCommandError(
+                f"ADB command failed: {detail or 'unknown error'}",
+                kind=classify_device_error(detail),
+            )
         return result
 
 
@@ -112,9 +126,22 @@ class AdbDeviceBackend:
     async def initialize(self, **connection: str) -> None:
         result = await self._runner.run("-s", self.config.serial, "get-state")
         if result.stdout.decode(errors="replace").strip() != "device":
-            raise AdbCommandError("Configured ADB target is not in device state")
+            raise AdbCommandError(
+                "Configured ADB target is not in device state",
+                kind=DeviceErrorKind.OFFLINE,
+            )
 
     async def take_screenshot(self) -> dict[str, object]:
+        final_error: AdbCommandError | None = None
+        for _ in range(2):
+            try:
+                return await self._take_screenshot_once()
+            except AdbCommandError as exc:
+                final_error = exc
+        assert final_error is not None
+        raise final_error
+
+    async def _take_screenshot_once(self) -> dict[str, object]:
         result = await self._runner.run(
             "-s", self.config.serial, "exec-out", "screencap", "-p"
         )
@@ -125,9 +152,15 @@ class AdbDeviceBackend:
                 dimensions = screenshot.size
                 image_format = screenshot.format
         except (UnidentifiedImageError, OSError) as exc:
-            raise AdbCommandError("ADB screenshot was not a valid image") from exc
+            raise AdbCommandError(
+                "ADB screenshot was not a valid image",
+                kind=DeviceErrorKind.INVALID_OBSERVATION,
+            ) from exc
         if image_format != "PNG":
-            raise AdbCommandError("ADB screenshot was not PNG")
+            raise AdbCommandError(
+                "ADB screenshot was not PNG",
+                kind=DeviceErrorKind.INVALID_OBSERVATION,
+            )
         encoded = base64.b64encode(result.stdout).decode("ascii")
         return {
             "screenshot": f"data:image/png;base64,{encoded}",
@@ -162,19 +195,26 @@ class AdbDeviceBackend:
         self,
         action: CanonicalAction,
         screenshot_dimensions: tuple[int, int],
-    ) -> str:
+    ) -> ActionResult:
         tool_call = self.to_tool_call(action, screenshot_dimensions)
         arguments = tool_call["arguments"]
-        await self._runner.run(
-            "-s",
-            self.config.serial,
-            "shell",
-            "input",
-            "tap",
-            str(arguments["x"]),
-            str(arguments["y"]),
-        )
-        return "ADB tap dispatched"
+        try:
+            await self._runner.run(
+                "-s",
+                self.config.serial,
+                "shell",
+                "input",
+                "tap",
+                str(arguments["x"]),
+                str(arguments["y"]),
+            )
+        except AdbCommandError as exc:
+            if exc.kind is DeviceErrorKind.TIMEOUT:
+                return ActionResult.ambiguous(
+                    "ADB tap result is unknown after timeout", exc.kind
+                )
+            return ActionResult.failed(str(exc), exc.kind)
+        return ActionResult.success("ADB tap dispatched")
 
     async def close(self) -> None:
         return None

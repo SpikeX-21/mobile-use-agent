@@ -15,6 +15,11 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from mcp.client.session import ClientSession
 import logging
 
+from mobile_agent.agent.mobile.result import (
+    DeviceBackendError,
+    classify_device_error,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -82,7 +87,10 @@ class MCPHub:
                 if response.content[0].text
                 else "MCP工具调用失败，未返回错误信息"
             )
-            raise Exception(text_content)
+            raise DeviceBackendError(
+                text_content,
+                kind=classify_device_error(text_content),
+            )
         return response
 
     def is_valid_mcp_response(self, result) -> bool:

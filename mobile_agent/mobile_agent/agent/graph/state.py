@@ -24,6 +24,8 @@ class SharedState(AgentState):
     iteration_count: int  # 当前迭代次数
     max_iterations: int  # 最大迭代次数
     oracle_failure_count: int  # 连续完成条件校验失败次数
+    schema_error_count: int  # 连续模型动作 Schema 错误次数
+    terminal_reason: Optional[str]  # 无需再调用模型的明确终止原因
 
 
 class ToolCallState(SharedState):

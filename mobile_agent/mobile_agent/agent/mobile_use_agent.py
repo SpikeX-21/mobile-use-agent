@@ -44,7 +44,7 @@ class MobileUseAgent:
         settings = get_settings()
         self.logger.info(f"agent_config: {agent_config}")
 
-        self.max_steps = agent_config.max_steps
+        self.max_steps = min(agent_config.max_steps, 10)
         self.step_interval = agent_config.step_interval
         self.model_provider_name = model_provider_name or settings.model_provider
         self.device_provider_name = device_provider_name or settings.device_provider
@@ -103,6 +103,8 @@ class MobileUseAgent:
                 "is_stream": is_stream,
                 "max_iterations": self.max_steps,
                 "oracle_failure_count": 0,
+                "schema_error_count": 0,
+                "terminal_reason": None,
                 "step_interval": self.step_interval,
             }
             model_provider = self._model_provider_factory(
@@ -120,7 +122,8 @@ class MobileUseAgent:
 
             config = {
                 "configurable": {"thread_id": thread_id},
-                "recursion_limit": self.max_steps * 3,
+                # prepare + 每轮 model/tool_valid/tool + 结束路由需要额外余量。
+                "recursion_limit": self.max_steps * 3 + 2,
             }
 
             async for chunk in self._graph.astream(

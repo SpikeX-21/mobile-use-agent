@@ -13,10 +13,16 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
-from mobile_agent.agent.actions import CanonicalAction
+from mobile_agent.agent.actions import CanonicalAction, ListAppsAction
 from mobile_agent.agent.actions.mcp_adapter import canonical_action_to_mcp_tool_call
 from mobile_agent.agent.infra.model import ToolCall
 from mobile_agent.agent.mobile.client import Mobile
+from mobile_agent.agent.mobile.result import (
+    ActionResult,
+    DeviceBackendError,
+    DeviceErrorKind,
+    classify_device_error,
+)
 from mobile_agent.agent.provider import (
     ProviderNotImplementedError,
     UnknownProviderError,
@@ -36,7 +42,7 @@ class DeviceBackend(Protocol):
         self,
         action: CanonicalAction,
         screenshot_dimensions: tuple[int, int],
-    ) -> Any: ...
+    ) -> ActionResult: ...
 
     def to_tool_call(
         self,
@@ -56,9 +62,10 @@ class McpDeviceBackend:
         self,
         mcp_hub: MCPHub | None = None,
         tools: Tools | Any | None = None,
+        mobile: Mobile | Any | None = None,
     ):
         self._mcp_hub = mcp_hub or MCPHub()
-        self._mobile = Mobile(self._mcp_hub)
+        self._mobile = mobile or Mobile(self._mcp_hub)
         self._tools = tools
 
     async def initialize(self, **connection: str) -> None:
@@ -67,17 +74,43 @@ class McpDeviceBackend:
             self._tools = await Tools.from_mcp(self._mcp_hub)
 
     async def take_screenshot(self) -> dict[str, Any]:
-        return await self._mobile.take_screenshot()
+        final_error: Exception | None = None
+        for _ in range(2):
+            try:
+                return await self._mobile.take_screenshot()
+            except Exception as exc:
+                final_error = exc
+        assert final_error is not None
+        kind = classify_device_error(final_error)
+        raise DeviceBackendError(str(final_error), kind=kind) from final_error
 
     async def execute(
         self,
         action: CanonicalAction,
         screenshot_dimensions: tuple[int, int],
-    ) -> Any:
+    ) -> ActionResult:
         if self._tools is None:
             raise RuntimeError("MCP device backend is not initialized")
         tool_call = self.to_tool_call(action, screenshot_dimensions)
-        return await self._tools.exec(tool_call)
+        attempts = 2 if isinstance(action, ListAppsAction) else 1
+        for attempt in range(attempts):
+            try:
+                result = await self._tools.exec(tool_call)
+                return ActionResult.success(str(result))
+            except Exception as exc:
+                kind = classify_device_error(exc)
+                if kind is DeviceErrorKind.TIMEOUT:
+                    if attempt + 1 < attempts:
+                        continue
+                    if isinstance(action, ListAppsAction):
+                        return ActionResult.failed(
+                            "MCP read timed out after bounded retry", kind
+                        )
+                    return ActionResult.ambiguous(
+                        "MCP action result is unknown after timeout", kind
+                    )
+                return ActionResult.failed(str(exc), kind)
+        raise AssertionError("MCP action attempt loop did not return")
 
     def to_tool_call(
         self,
