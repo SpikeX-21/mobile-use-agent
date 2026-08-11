@@ -103,6 +103,34 @@ class CanonicalActionTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             validate_canonical_action({"type": "text_input", "text": ""})
 
+    def test_rejects_null_bytes_that_subprocess_arguments_cannot_represent(self):
+        with self.assertRaises(ValidationError):
+            validate_canonical_action(
+                {"type": "text_input", "text": "safe\x00unsafe"}
+            )
+
+    def test_rejects_unsafe_android_package_names(self):
+        invalid_package_names = (
+            "com.autonavi.minimap;reboot",
+            "com.autonavi minimap",
+            "com/autonavi/minimap",
+            "single_segment",
+            ".com.autonavi.minimap",
+        )
+
+        for action_type in ("launch_app", "close_app"):
+            for package_name in invalid_package_names:
+                with self.subTest(
+                    action_type=action_type, package_name=package_name
+                ):
+                    with self.assertRaises(ValidationError):
+                        validate_canonical_action(
+                            {
+                                "type": action_type,
+                                "package_name": package_name,
+                            }
+                        )
+
     def test_swipe_strictly_validates_coordinates_and_duration(self):
         invalid_swipes = [
             {

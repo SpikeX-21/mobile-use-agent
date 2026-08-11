@@ -43,24 +43,20 @@ def latest_screenshot_url(request):
 
 class SequenceRunner:
     def __init__(self):
-        image = screenshot_bytes()
-        self.responses = [
-            AdbCommandResult(stdout=b"device\n"),
-            AdbCommandResult(),
-            AdbCommandResult(),
-            AdbCommandResult(stdout=image),
-            AdbCommandResult(stdout=image),
-            AdbCommandResult(),
-            AdbCommandResult(stdout=image),
-            AdbCommandResult(
-                stdout=b"mCurrentFocus=Window{1 u0 com.autonavi.minimap/.MapActivity}"
-            ),
-        ]
+        self.image = screenshot_bytes()
         self.calls = []
 
     async def run(self, *arguments):
         self.calls.append(arguments)
-        return self.responses.pop(0)
+        if arguments[-1] == "get-state":
+            return AdbCommandResult(stdout=b"device\n")
+        if arguments[-3:] == ("exec-out", "screencap", "-p"):
+            return AdbCommandResult(stdout=self.image)
+        if arguments[-2:] == ("dumpsys", "window"):
+            return AdbCommandResult(
+                stdout=b"mCurrentFocus=Window{1 u0 com.autonavi.minimap/.MapActivity}"
+            )
+        return AdbCommandResult()
 
 
 class SearchScenarioRunner:
@@ -123,11 +119,35 @@ class DetailScenarioRunner:
         return AdbCommandResult()
 
 
+class AtomicActionRunner:
+    def __init__(self):
+        self.image = screenshot_bytes()
+        self.calls = []
+
+    async def run(self, *arguments):
+        self.calls.append(arguments)
+        if arguments[-1] == "get-state":
+            return AdbCommandResult(stdout=b"device\n")
+        if arguments[-3:] == ("exec-out", "screencap", "-p"):
+            return AdbCommandResult(stdout=self.image)
+        if arguments[-4:] == ("pm", "list", "packages", "-3"):
+            return AdbCommandResult(stdout=b"package:com.autonavi.minimap\n")
+        if arguments[-3:] == ("pm", "list", "packages"):
+            return AdbCommandResult(stdout=b"package:com.autonavi.minimap\n")
+        if "resolve-activity" in arguments:
+            return AdbCommandResult(
+                stdout=(
+                    b"com.autonavi.minimap/"
+                    b"com.autonavi.map.activity.SplashActivity\n"
+                )
+            )
+        return AdbCommandResult()
+
+
 class SequenceCompletions:
     def __init__(self):
         self.requests = []
         self.responses = [
-            {"summary": "尝试按包名打开", "action": {"type": "launch_app", "package_name": "com.autonavi.minimap"}},
             {"summary": "视觉定位并点击高德地图", "action": {"type": "tap", "x": 500, "y": 400}},
             {"summary": "高德地图已打开", "action": {"type": "finish", "summary": "高德地图已打开"}},
         ]
@@ -218,6 +238,125 @@ class KimiAdbAgentLoopTests(unittest.IsolatedAsyncioTestCase):
         )
         return runner, completions, custom_output
 
+    async def test_remaining_atomic_actions_flow_through_real_agent_graph(self):
+        examples = (
+            (
+                {"type": "home"},
+                "mobile:home",
+                ("shell", "input", "keyevent", "KEYCODE_HOME"),
+            ),
+            (
+                {"type": "back"},
+                "mobile:back",
+                ("shell", "input", "keyevent", "KEYCODE_BACK"),
+            ),
+            (
+                {"type": "menu"},
+                "mobile:menu",
+                ("shell", "input", "keyevent", "KEYCODE_MENU"),
+            ),
+            (
+                {
+                    "type": "launch_app",
+                    "package_name": "com.autonavi.minimap",
+                },
+                "mobile:launch_app",
+                (
+                    "shell",
+                    "am",
+                    "start",
+                    "-n",
+                    "com.autonavi.minimap/"
+                    "com.autonavi.map.activity.SplashActivity",
+                ),
+            ),
+            (
+                {
+                    "type": "close_app",
+                    "package_name": "com.autonavi.minimap",
+                },
+                "mobile:close_app",
+                ("shell", "am", "force-stop", "com.autonavi.minimap"),
+            ),
+            (
+                {"type": "list_apps", "ignore_system_apps": True},
+                "mobile:list_apps",
+                ("shell", "pm", "list", "packages", "-3"),
+            ),
+        )
+
+        for action_payload, tool_name, command_suffix in examples:
+            with self.subTest(action=action_payload["type"]):
+                runner = AtomicActionRunner()
+                backend = AdbDeviceBackend(
+                    AdbConfig(serial="device-1"), runner=runner
+                )
+                completions = ScriptedCompletions(
+                    [
+                        {
+                            "summary": "执行原子动作",
+                            "action": action_payload,
+                        },
+                        {
+                            "summary": "测试动作已观察",
+                            "action": {
+                                "type": "fail",
+                                "reason": "测试到此结束",
+                            },
+                        },
+                    ]
+                )
+                client = SimpleNamespace(
+                    chat=SimpleNamespace(completions=completions)
+                )
+
+                def model_factory(name, *, thread_id, is_stream):
+                    return KimiModelProvider(
+                        thread_id=thread_id,
+                        config=KimiConfig(
+                            api_key=SecretStr("unit-test-key")
+                        ),
+                        client=client,
+                    )
+
+                agent = MobileUseAgent(
+                    model_provider_name="kimi",
+                    device_provider_name="adb",
+                    model_provider_factory=model_factory,
+                    device_backend_factory=lambda name: backend,
+                )
+                agent.step_interval = 0
+                await agent.initialize("", "", "", "", "", "")
+                chunks = [
+                    chunk
+                    async for chunk in agent.run(
+                        "执行原子动作测试",
+                        is_stream=False,
+                        task_id="task-kimi-atomic-action",
+                        session_id="session-kimi-atomic-action",
+                        thread_id=f"chat-{uuid.uuid4()}",
+                        sse_connection=asyncio.Event(),
+                        phone_width=1080,
+                        phone_height=2278,
+                    )
+                ]
+                custom_output = "\n".join(
+                    chunk[1]
+                    for chunk in chunks
+                    if isinstance(chunk, tuple)
+                    and chunk[0] == "custom"
+                    and isinstance(chunk[1], str)
+                )
+
+                self.assertIn(f'"tool_name": "{tool_name}"', custom_output)
+                self.assertTrue(
+                    any(
+                        call[-len(command_suffix) :] == command_suffix
+                        for call in runner.calls
+                    )
+                )
+                self.assertEqual(len(completions.requests), 2)
+
     async def test_visual_tap_flows_through_real_agent_graph(self):
         runner = SequenceRunner()
         backend = AdbDeviceBackend(AdbConfig(serial="device-1"), runner=runner)
@@ -278,7 +417,7 @@ class KimiAdbAgentLoopTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assertEqual(first_request["extra_body"]["thinking"]["type"], "disabled")
-        self.assertEqual(len(completions.requests), 3)
+        self.assertEqual(len(completions.requests), 2)
 
     async def test_search_task_flows_through_agent_and_independent_oracle(self):
         runner = SearchScenarioRunner()

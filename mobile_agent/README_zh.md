@@ -106,11 +106,15 @@ conda activate mobile-use-agent
 python main.py
 ```
 
-该 Demo 每轮通过 `adb exec-out screencap -p` 获取截图，以 Base64 发送给 Kimi，
-并支持将 `tap`、`swipe`、`text_input`、`clear_text` 和 `wait` 下发给 ADB Backend。
+该 Demo 每轮通过 `adb exec-out screencap -p` 获取截图，以 Base64 发送给 Kimi。
+ADB Backend 支持 `tap`、`swipe`、`text_input`、`clear_text`、`home`、`back`、
+`menu`、`launch_app`、`close_app`、`list_apps` 和 `wait`。截图始终由 Agent 自动
+观察，不是模型动作；`autoinstall_app` 不属于 Demo 的原子能力。
 坐标采用 0–1000 归一化格式，执行前会按截图尺寸转换为像素。安全 ASCII 文本使用
 `adb shell input text`；中文和特殊字符使用 Android UTF-8 剪贴板及
 `KEYCODE_PASTE`，避免依赖已废弃的云手机私有广播。清空文本使用 Ctrl+A 后删除。
+应用包名必须符合 Android application ID 格式。`list_apps` 可通过
+`ignore_system_apps=true` 只列出第三方应用，并会过滤无效命令输出。
 
 每个任务开始前会强制停止高德地图并返回桌面，但不会执行 `pm clear`。任务完成由
 独立 Oracle 验证：`adb shell dumpsys window` 必须确认前台包为

@@ -16,10 +16,16 @@ from typing import Protocol
 from PIL import Image, UnidentifiedImageError
 
 from mobile_agent.agent.actions import (
+    BackAction,
     CanonicalAction,
     ClearTextAction,
+    CloseAppAction,
     FailAction,
     FinishAction,
+    HomeAction,
+    LaunchAppAction,
+    ListAppsAction,
+    MenuAction,
     SwipeAction,
     TapAction,
     TextInputAction,
@@ -247,6 +253,29 @@ class AdbDeviceBackend:
             }
         if isinstance(action, ClearTextAction):
             return {"name": "mobile:clear_text", "arguments": {}}
+        if isinstance(action, HomeAction):
+            return {"name": "mobile:home", "arguments": {}}
+        if isinstance(action, BackAction):
+            return {"name": "mobile:back", "arguments": {}}
+        if isinstance(action, MenuAction):
+            return {"name": "mobile:menu", "arguments": {}}
+        if isinstance(action, LaunchAppAction):
+            return {
+                "name": "mobile:launch_app",
+                "arguments": {"package_name": action.package_name},
+            }
+        if isinstance(action, CloseAppAction):
+            return {
+                "name": "mobile:close_app",
+                "arguments": {"package_name": action.package_name},
+            }
+        if isinstance(action, ListAppsAction):
+            arguments = (
+                {}
+                if action.ignore_system_apps is None
+                else {"ignore_system_apps": action.ignore_system_apps}
+            )
+            return {"name": "mobile:list_apps", "arguments": arguments}
         if isinstance(action, WaitAction):
             return {"name": "wait", "arguments": {"t": action.duration_ms / 1000}}
         if isinstance(action, FinishAction):
@@ -269,6 +298,8 @@ class AdbDeviceBackend:
             return ActionResult.success(
                 f"Waited {action.duration_ms / 1000:g}s for the UI to settle"
             )
+        if isinstance(action, ListAppsAction):
+            return await self._list_apps(action)
         try:
             if isinstance(action, TapAction):
                 await self._runner.run(
@@ -313,6 +344,45 @@ class AdbDeviceBackend:
                     "keyevent",
                     "KEYCODE_DEL",
                 )
+            elif isinstance(action, (HomeAction, BackAction, MenuAction)):
+                keycode = {
+                    "home": "KEYCODE_HOME",
+                    "back": "KEYCODE_BACK",
+                    "menu": "KEYCODE_MENU",
+                }[action.type]
+                await self._runner.run(
+                    "-s",
+                    self.config.serial,
+                    "shell",
+                    "input",
+                    "keyevent",
+                    keycode,
+                )
+            elif isinstance(action, LaunchAppAction):
+                try:
+                    component = await self._resolve_launcher_component(
+                        action.package_name
+                    )
+                except AdbCommandError as exc:
+                    return ActionResult.failed(str(exc), exc.kind)
+                await self._runner.run(
+                    "-s",
+                    self.config.serial,
+                    "shell",
+                    "am",
+                    "start",
+                    "-n",
+                    component,
+                )
+            elif isinstance(action, CloseAppAction):
+                await self._runner.run(
+                    "-s",
+                    self.config.serial,
+                    "shell",
+                    "am",
+                    "force-stop",
+                    action.package_name,
+                )
             else:
                 raise NotImplementedError(
                     f"ADB backend cannot execute {type(action).__name__}"
@@ -324,6 +394,73 @@ class AdbDeviceBackend:
                 )
             return ActionResult.failed(str(exc), exc.kind)
         return ActionResult.success(f"ADB {action.type} dispatched")
+
+    async def _list_apps(self, action: ListAppsAction) -> ActionResult:
+        command = [
+            "-s",
+            self.config.serial,
+            "shell",
+            "pm",
+            "list",
+            "packages",
+        ]
+        if action.ignore_system_apps:
+            command.append("-3")
+        for attempt in range(2):
+            try:
+                result = await self._runner.run(*command)
+                packages = sorted(
+                    {
+                        package_name
+                        for line in result.stdout.decode(
+                            "utf-8", errors="replace"
+                        ).splitlines()
+                        if line.startswith("package:")
+                        for package_name in [line.removeprefix("package:")]
+                        if re.fullmatch(
+                            r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+",
+                            package_name,
+                        )
+                    }
+                )
+                return ActionResult.success(
+                    f"Installed packages ({len(packages)}): "
+                    + ", ".join(packages)
+                )
+            except AdbCommandError as exc:
+                if exc.kind is DeviceErrorKind.TIMEOUT and attempt == 0:
+                    continue
+                return ActionResult.failed(str(exc), exc.kind)
+        raise AssertionError("ADB list_apps attempt loop did not return")
+
+    async def _resolve_launcher_component(self, package_name: str) -> str:
+        result = await self._runner.run(
+            "-s",
+            self.config.serial,
+            "shell",
+            "cmd",
+            "package",
+            "resolve-activity",
+            "--brief",
+            "-a",
+            "android.intent.action.MAIN",
+            "-c",
+            "android.intent.category.LAUNCHER",
+            package_name,
+        )
+        component_pattern = re.compile(
+            rf"{re.escape(package_name)}/[A-Za-z0-9_.$]+"
+        )
+        for line in reversed(
+            result.stdout.decode("utf-8", errors="replace").splitlines()
+        ):
+            component = line.strip()
+            if component_pattern.fullmatch(component):
+                return component
+        raise AdbCommandError(
+            "ADB could not resolve a launcher activity for the package",
+            kind=DeviceErrorKind.COMMAND_FAILED,
+        )
 
     async def _input_text(self, text: str) -> None:
         if re.fullmatch(r"[A-Za-z0-9._@+\-]+", text):
@@ -337,15 +474,14 @@ class AdbDeviceBackend:
             )
             return
 
-        encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
-        clipboard_command = (
-            f'cmd clipboard set "$(echo {encoded} | base64 -d)"'
-        )
         await self._runner.run(
             "-s",
             self.config.serial,
-            "shell",
-            clipboard_command,
+            "exec-out",
+            "cmd",
+            "clipboard",
+            "set",
+            text,
         )
         await self._runner.run(
             "-s",

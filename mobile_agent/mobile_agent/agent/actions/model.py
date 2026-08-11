@@ -21,6 +21,10 @@ class ActionModel(BaseModel):
 
 
 NormalizedCoordinate = Annotated[int, Field(ge=0, le=1000)]
+AndroidPackageName = Annotated[
+    str,
+    Field(pattern=r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+$"),
+]
 
 
 class TapAction(ActionModel):
@@ -40,7 +44,7 @@ class SwipeAction(ActionModel):
 
 class TextInputAction(ActionModel):
     type: Literal["text_input"] = "text_input"
-    text: str = Field(min_length=1)
+    text: str = Field(min_length=1, pattern=r"^[^\x00]+$")
 
 
 class ClearTextAction(ActionModel):
@@ -61,12 +65,12 @@ class MenuAction(ActionModel):
 
 class LaunchAppAction(ActionModel):
     type: Literal["launch_app"] = "launch_app"
-    package_name: str = Field(min_length=1)
+    package_name: AndroidPackageName
 
 
 class CloseAppAction(ActionModel):
     type: Literal["close_app"] = "close_app"
-    package_name: str = Field(min_length=1)
+    package_name: AndroidPackageName
 
 
 class ListAppsAction(ActionModel):

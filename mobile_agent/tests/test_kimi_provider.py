@@ -61,11 +61,23 @@ class KimiModelProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("latest screenshot", KimiModelProvider.prompt)
         self.assertIn("do not blindly repeat", KimiModelProvider.prompt)
 
-    def test_prompt_allows_search_text_clear_and_wait_actions(self):
+    def test_prompt_allows_complete_adb_action_vocabulary(self):
         self.assertIn('"type":"text_input"', KimiModelProvider.prompt)
         self.assertIn('"type":"clear_text"', KimiModelProvider.prompt)
         self.assertIn('"type":"wait"', KimiModelProvider.prompt)
-        self.assertNotIn('"type":"launch_app"', KimiModelProvider.prompt)
+        for action_type in (
+            "home",
+            "back",
+            "menu",
+            "launch_app",
+            "close_app",
+            "list_apps",
+        ):
+            with self.subTest(action_type=action_type):
+                self.assertIn(f'"type":"{action_type}"', KimiModelProvider.prompt)
+
+        self.assertNotIn('"type":"take_screenshot"', KimiModelProvider.prompt)
+        self.assertNotIn('"type":"autoinstall_app"', KimiModelProvider.prompt)
 
     def test_prompt_allows_swipe_only_when_a_result_is_not_visible(self):
         self.assertIn('"type":"swipe"', KimiModelProvider.prompt)

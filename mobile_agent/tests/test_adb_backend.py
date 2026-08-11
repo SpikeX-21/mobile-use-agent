@@ -15,8 +15,14 @@ from PIL import Image
 from pydantic import SecretStr
 
 from mobile_agent.agent.actions import (
+    BackAction,
     ClearTextAction,
+    CloseAppAction,
     FinishAction,
+    HomeAction,
+    LaunchAppAction,
+    ListAppsAction,
+    MenuAction,
     SwipeAction,
     TapAction,
     TextInputAction,
@@ -38,6 +44,17 @@ def png_bytes(width: int = 1080, height: int = 2400) -> bytes:
     output = io.BytesIO()
     Image.new("RGB", (width, height), "white").save(output, format="PNG")
     return output.getvalue()
+
+
+def remaining_adb_actions():
+    return (
+        HomeAction(),
+        BackAction(),
+        MenuAction(),
+        LaunchAppAction(package_name="com.autonavi.minimap"),
+        CloseAppAction(package_name="com.autonavi.minimap"),
+        ListAppsAction(),
+    )
 
 
 class RecordingRunner:
@@ -232,7 +249,7 @@ class AdbDeviceBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.error_kind, DeviceErrorKind.TIMEOUT)
         self.assertEqual(len(runner.calls), 1)
 
-    async def test_chinese_text_uses_encoded_utf8_clipboard_and_paste_key(self):
+    async def test_chinese_text_uses_parameterized_clipboard_and_paste_key(self):
         runner = RecordingRunner([AdbCommandResult(), AdbCommandResult()])
         backend = AdbDeviceBackend(self.make_config(), runner=runner)
 
@@ -251,8 +268,11 @@ class AdbDeviceBackendTests(unittest.IsolatedAsyncioTestCase):
                 (
                     "-s",
                     "device-1",
-                    "shell",
-                    'cmd clipboard set "$(echo 5LiK5rW35aSW5rup | base64 -d)"',
+                    "exec-out",
+                    "cmd",
+                    "clipboard",
+                    "set",
+                    "上海外滩",
                 ),
                 ("-s", "device-1", "shell", "input", "keyevent", "KEYCODE_PASTE"),
             ],
@@ -281,7 +301,7 @@ class AdbDeviceBackendTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-    async def test_special_characters_never_reach_remote_shell_unencoded(self):
+    async def test_special_characters_use_exec_out_without_remote_shell(self):
         runner = RecordingRunner([AdbCommandResult(), AdbCommandResult()])
         backend = AdbDeviceBackend(self.make_config(), runner=runner)
 
@@ -293,13 +313,18 @@ class AdbDeviceBackendTests(unittest.IsolatedAsyncioTestCase):
                 (
                     "-s",
                     "device-1",
-                    "shell",
-                    'cmd clipboard set "$(echo YTti | base64 -d)"',
+                    "exec-out",
+                    "cmd",
+                    "clipboard",
+                    "set",
+                    "a;b",
                 ),
                 ("-s", "device-1", "shell", "input", "keyevent", "KEYCODE_PASTE"),
             ],
         )
-        self.assertNotIn("a;b", runner.calls[0][-1])
+        self.assertNotIn("shell", runner.calls[0])
+        self.assertNotIn("|", runner.calls[0])
+        self.assertNotIn("$(", runner.calls[0])
 
     async def test_clear_text_selects_all_then_deletes(self):
         runner = RecordingRunner([AdbCommandResult(), AdbCommandResult()])
@@ -319,6 +344,325 @@ class AdbDeviceBackendTests(unittest.IsolatedAsyncioTestCase):
                 ("-s", "device-1", "shell", "input", "keyevent", "KEYCODE_DEL"),
             ],
         )
+
+    async def test_navigation_keys_execute_on_the_configured_device(self):
+        examples = (
+            (HomeAction(), "KEYCODE_HOME", "mobile:home"),
+            (BackAction(), "KEYCODE_BACK", "mobile:back"),
+            (MenuAction(), "KEYCODE_MENU", "mobile:menu"),
+        )
+
+        for action, keycode, tool_name in examples:
+            with self.subTest(action=action.type):
+                runner = RecordingRunner([AdbCommandResult()])
+                backend = AdbDeviceBackend(self.make_config(), runner=runner)
+
+                result = await backend.execute(action, (1080, 2400))
+
+                self.assertEqual(result.status, ActionResultStatus.SUCCESS)
+                self.assertEqual(
+                    backend.to_tool_call(action, (1080, 2400)),
+                    {"name": tool_name, "arguments": {}},
+                )
+                self.assertEqual(
+                    runner.calls,
+                    [
+                        (
+                            "-s",
+                            "device-1",
+                            "shell",
+                            "input",
+                            "keyevent",
+                            keycode,
+                        )
+                    ],
+                )
+
+    async def test_app_lifecycle_actions_use_validated_package_arguments(self):
+        examples = (
+            (
+                LaunchAppAction(package_name="com.autonavi.minimap"),
+                "mobile:launch_app",
+                [
+                    AdbCommandResult(
+                        stdout=(
+                            b"com.autonavi.minimap/"
+                            b"com.autonavi.map.activity.SplashActivity\n"
+                        )
+                    ),
+                    AdbCommandResult(),
+                ],
+                [
+                    (
+                        "-s",
+                        "device-1",
+                        "shell",
+                        "cmd",
+                        "package",
+                        "resolve-activity",
+                        "--brief",
+                        "-a",
+                        "android.intent.action.MAIN",
+                        "-c",
+                        "android.intent.category.LAUNCHER",
+                        "com.autonavi.minimap",
+                    ),
+                    (
+                        "-s",
+                        "device-1",
+                        "shell",
+                        "am",
+                        "start",
+                        "-n",
+                        "com.autonavi.minimap/"
+                        "com.autonavi.map.activity.SplashActivity",
+                    ),
+                ],
+            ),
+            (
+                CloseAppAction(package_name="com.autonavi.minimap"),
+                "mobile:close_app",
+                [AdbCommandResult()],
+                [
+                    (
+                        "-s",
+                        "device-1",
+                        "shell",
+                        "am",
+                        "force-stop",
+                        "com.autonavi.minimap",
+                    )
+                ],
+            ),
+        )
+
+        for action, tool_name, responses, commands in examples:
+            with self.subTest(action=action.type):
+                runner = RecordingRunner(responses)
+                backend = AdbDeviceBackend(self.make_config(), runner=runner)
+
+                result = await backend.execute(action, (1080, 2400))
+
+                self.assertEqual(result.status, ActionResultStatus.SUCCESS)
+                self.assertEqual(
+                    backend.to_tool_call(action, (1080, 2400)),
+                    {
+                        "name": tool_name,
+                        "arguments": {
+                            "package_name": "com.autonavi.minimap"
+                        },
+                    },
+                )
+                self.assertEqual(runner.calls, commands)
+
+    async def test_list_apps_returns_sanitized_packages_from_configured_device(self):
+        runner = RecordingRunner(
+            [
+                AdbCommandResult(
+                    stdout=(
+                        b"package:com.example.zeta\n"
+                        b"unexpected output\n"
+                        b"package:com.autonavi.minimap\n"
+                    )
+                )
+            ]
+        )
+        backend = AdbDeviceBackend(self.make_config(), runner=runner)
+        action = ListAppsAction(ignore_system_apps=True)
+
+        result = await backend.execute(action, (1080, 2400))
+
+        self.assertEqual(result.status, ActionResultStatus.SUCCESS)
+        self.assertEqual(
+            result.message,
+            "Installed packages (2): com.autonavi.minimap, com.example.zeta",
+        )
+        self.assertEqual(
+            backend.to_tool_call(action, (1080, 2400)),
+            {
+                "name": "mobile:list_apps",
+                "arguments": {"ignore_system_apps": True},
+            },
+        )
+        self.assertEqual(
+            runner.calls,
+            [
+                (
+                    "-s",
+                    "device-1",
+                    "shell",
+                    "pm",
+                    "list",
+                    "packages",
+                    "-3",
+                )
+            ],
+        )
+
+    async def test_remaining_actions_classify_nonzero_command_failures(self):
+        class NonZeroRunner:
+            def __init__(self):
+                self.calls = []
+
+            async def run(self, *arguments):
+                self.calls.append(arguments)
+                raise AdbCommandError(
+                    "ADB command failed: exit 1",
+                    kind=DeviceErrorKind.COMMAND_FAILED,
+                )
+
+        for action in remaining_adb_actions():
+            with self.subTest(action=action.type):
+                runner = NonZeroRunner()
+                backend = AdbDeviceBackend(self.make_config(), runner=runner)
+
+                result = await backend.execute(action, (1080, 2400))
+
+                self.assertEqual(result.status, ActionResultStatus.FAILED)
+                self.assertEqual(
+                    result.error_kind, DeviceErrorKind.COMMAND_FAILED
+                )
+                self.assertEqual(len(runner.calls), 1)
+
+    async def test_remaining_actions_classify_device_offline_without_retry(self):
+        class OfflineRunner:
+            def __init__(self):
+                self.calls = []
+
+            async def run(self, *arguments):
+                self.calls.append(arguments)
+                raise AdbCommandError(
+                    "device offline", kind=DeviceErrorKind.OFFLINE
+                )
+
+        for action in remaining_adb_actions():
+            with self.subTest(action=action.type):
+                runner = OfflineRunner()
+                backend = AdbDeviceBackend(self.make_config(), runner=runner)
+
+                result = await backend.execute(action, (1080, 2400))
+
+                self.assertEqual(result.status, ActionResultStatus.FAILED)
+                self.assertEqual(result.error_kind, DeviceErrorKind.OFFLINE)
+                self.assertEqual(len(runner.calls), 1)
+
+    async def test_remaining_side_effect_timeouts_are_ambiguous_without_retry(self):
+        side_effect_actions = tuple(
+            action
+            for action in remaining_adb_actions()[:-1]
+            if not isinstance(action, LaunchAppAction)
+        )
+
+        class TimingOutRunner:
+            def __init__(self):
+                self.calls = []
+
+            async def run(self, *arguments):
+                self.calls.append(arguments)
+                raise AdbCommandError(
+                    "ADB command timed out", kind=DeviceErrorKind.TIMEOUT
+                )
+
+        for action in side_effect_actions:
+            with self.subTest(action=action.type):
+                runner = TimingOutRunner()
+                backend = AdbDeviceBackend(self.make_config(), runner=runner)
+
+                result = await backend.execute(action, (1080, 2400))
+
+                self.assertEqual(result.status, ActionResultStatus.AMBIGUOUS)
+                self.assertEqual(result.error_kind, DeviceErrorKind.TIMEOUT)
+                self.assertEqual(len(runner.calls), 1)
+
+    async def test_launch_resolution_timeout_is_failed_before_dispatch(self):
+        class ResolutionTimeoutRunner:
+            def __init__(self):
+                self.calls = []
+
+            async def run(self, *arguments):
+                self.calls.append(arguments)
+                raise AdbCommandError(
+                    "ADB command timed out", kind=DeviceErrorKind.TIMEOUT
+                )
+
+        runner = ResolutionTimeoutRunner()
+        backend = AdbDeviceBackend(self.make_config(), runner=runner)
+
+        result = await backend.execute(
+            LaunchAppAction(package_name="com.autonavi.minimap"),
+            (1080, 2400),
+        )
+
+        self.assertEqual(result.status, ActionResultStatus.FAILED)
+        self.assertEqual(result.error_kind, DeviceErrorKind.TIMEOUT)
+        self.assertEqual(len(runner.calls), 1)
+
+    async def test_launch_dispatch_timeout_is_ambiguous_without_retry(self):
+        class DispatchTimeoutRunner:
+            def __init__(self):
+                self.calls = []
+
+            async def run(self, *arguments):
+                self.calls.append(arguments)
+                if len(self.calls) == 1:
+                    return AdbCommandResult(
+                        stdout=(
+                            b"com.autonavi.minimap/"
+                            b"com.autonavi.map.activity.SplashActivity\n"
+                        )
+                    )
+                raise AdbCommandError(
+                    "ADB command timed out", kind=DeviceErrorKind.TIMEOUT
+                )
+
+        runner = DispatchTimeoutRunner()
+        backend = AdbDeviceBackend(self.make_config(), runner=runner)
+
+        result = await backend.execute(
+            LaunchAppAction(package_name="com.autonavi.minimap"),
+            (1080, 2400),
+        )
+
+        self.assertEqual(result.status, ActionResultStatus.AMBIGUOUS)
+        self.assertEqual(result.error_kind, DeviceErrorKind.TIMEOUT)
+        self.assertEqual(len(runner.calls), 2)
+
+    async def test_list_apps_timeout_has_one_bounded_retry(self):
+        class FlakyListRunner:
+            def __init__(self, always_timeout=False):
+                self.always_timeout = always_timeout
+                self.calls = []
+
+            async def run(self, *arguments):
+                self.calls.append(arguments)
+                if self.always_timeout or len(self.calls) == 1:
+                    raise AdbCommandError(
+                        "ADB command timed out", kind=DeviceErrorKind.TIMEOUT
+                    )
+                return AdbCommandResult(stdout=b"package:com.example.app\n")
+
+        recovering_runner = FlakyListRunner()
+        recovering_backend = AdbDeviceBackend(
+            self.make_config(), runner=recovering_runner
+        )
+
+        recovered = await recovering_backend.execute(
+            ListAppsAction(), (1080, 2400)
+        )
+
+        self.assertEqual(recovered.status, ActionResultStatus.SUCCESS)
+        self.assertEqual(len(recovering_runner.calls), 2)
+
+        failing_runner = FlakyListRunner(always_timeout=True)
+        failing_backend = AdbDeviceBackend(
+            self.make_config(), runner=failing_runner
+        )
+
+        failed = await failing_backend.execute(ListAppsAction(), (1080, 2400))
+
+        self.assertEqual(failed.status, ActionResultStatus.FAILED)
+        self.assertEqual(failed.error_kind, DeviceErrorKind.TIMEOUT)
+        self.assertEqual(len(failing_runner.calls), 2)
 
     async def test_wait_is_executed_by_adb_backend_without_an_adb_command(self):
         runner = RecordingRunner([])
