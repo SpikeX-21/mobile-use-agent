@@ -11,7 +11,7 @@
 
 import asyncio
 import logging
-from mobile_agent.agent.actions import FailAction, FinishAction, WaitAction
+from mobile_agent.agent.actions import FailAction, FinishAction
 from mobile_agent.agent.llm.provider import ActionParseError
 from mobile_agent.exception.sse import SSEException
 from mobile_agent.agent.memory.context_manager import ContextManager
@@ -219,7 +219,7 @@ async def tool_valid_node(state: MobileUseAgentState) -> MobileUseAgentState:
         if await verify_completion(action) is False:
             oracle_failure_count = state.get("oracle_failure_count", 0) + 1
             if oracle_failure_count >= 2:
-                action = FailAction(reason="ADB 前台应用连续两次未满足完成条件")
+                action = FailAction(reason="ADB 独立 Oracle 连续两次未满足完成条件")
                 state.update(oracle_failure_count=oracle_failure_count)
             else:
                 if _retry_would_exceed_step_limit(state):
@@ -236,7 +236,7 @@ async def tool_valid_node(state: MobileUseAgentState) -> MobileUseAgentState:
                         "arguments": {"content": "completion oracle not satisfied"},
                     },
                     tool_output={
-                        "result": "ADB 前台应用校验未通过，请根据最新截图继续操作"
+                        "result": "ADB 独立 Oracle 校验未通过，请根据最新截图继续操作"
                     },
                 )
                 return state
@@ -316,20 +316,14 @@ async def tool_node(state: MobileUseAgentState) -> MobileUseAgentState:
     action_result: ActionResult
     device_backend = agent_object_manager.get_device_backend(state.get("thread_id"))
     try:
-        if isinstance(action, WaitAction):
-            await asyncio.sleep(action.duration_ms / 1000)
-            action_result = ActionResult.success(
-                f"已等待{action.duration_ms / 1000:g}s"
-            )
-        else:
-            raw_result = await device_backend.execute(
-                action, state.get("screenshot_dimensions")
-            )
-            action_result = (
-                raw_result
-                if isinstance(raw_result, ActionResult)
-                else ActionResult.success(str(raw_result))
-            )
+        raw_result = await device_backend.execute(
+            action, state.get("screenshot_dimensions")
+        )
+        action_result = (
+            raw_result
+            if isinstance(raw_result, ActionResult)
+            else ActionResult.success(str(raw_result))
+        )
     except TimeoutError:
         action_result = ActionResult.ambiguous(
             "设备动作超时，结果不确定", DeviceErrorKind.TIMEOUT

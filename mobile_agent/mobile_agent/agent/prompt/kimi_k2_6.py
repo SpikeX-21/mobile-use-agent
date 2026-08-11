@@ -19,9 +19,11 @@ Return one JSON object and no surrounding markdown:
 
 Allowed actions:
 - {"type":"tap","x":0..1000,"y":0..1000}
+- {"type":"text_input","text":"non-empty text"}
+- {"type":"clear_text"}
 - {"type":"wait","duration_ms":1..10000}
 - {"type":"finish","summary":"..."}
 - {"type":"fail","reason":"..."}
 
-Coordinates are normalized integers relative to the screenshot: (0,0) is top-left and (1000,1000) is bottom-right. This visual-click demo supports no device action other than tap: never emit take_screenshot, autoinstall_app, launch_app, swipe, text_input, home, back, menu, or any unlisted action. Screenshots are supplied automatically. If the previous action status is ambiguous, use the latest screenshot to determine whether it took effect; do not blindly repeat the action because its response timed out. When the task is to open an app from the visible home screen, identify its icon visually and use tap. Only return finish after the latest screenshot visibly proves the task is complete.
+Coordinates are normalized integers relative to the screenshot: (0,0) is top-left and (1000,1000) is bottom-right. Never emit take_screenshot, autoinstall_app, launch_app, swipe, home, back, menu, or any unlisted action. Screenshots are supplied automatically. Use text_input only after the latest screenshot shows that the intended input field is focused; use clear_text first when that field contains stale text. Use wait only when the UI needs time to settle. If the previous action status is ambiguous, use the latest screenshot to determine whether it took effect; do not blindly repeat the action because its response timed out. When the task is to open an app from the visible home screen, identify its icon visually and use tap. Only return finish after the latest screenshot visibly proves the task is complete.
 """

@@ -61,6 +61,12 @@ class KimiModelProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("latest screenshot", KimiModelProvider.prompt)
         self.assertIn("do not blindly repeat", KimiModelProvider.prompt)
 
+    def test_prompt_allows_search_text_clear_and_wait_actions(self):
+        self.assertIn('"type":"text_input"', KimiModelProvider.prompt)
+        self.assertIn('"type":"clear_text"', KimiModelProvider.prompt)
+        self.assertIn('"type":"wait"', KimiModelProvider.prompt)
+        self.assertNotIn('"type":"launch_app"', KimiModelProvider.prompt)
+
     def test_thinking_mode_cannot_be_enabled(self):
         with self.assertRaises(ValidationError):
             KimiConfig(api_key=SecretStr("unit-test-key"), thinking_mode="enabled")

@@ -127,6 +127,17 @@ class DoubaoMcpCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.error_kind, DeviceErrorKind.TIMEOUT)
         self.assertEqual(tools.calls, 2)
 
+    async def test_wait_is_owned_by_device_backend_without_calling_mcp(self):
+        tools = RecordingTools()
+        backend = McpDeviceBackend(tools=tools)
+
+        result = await backend.execute(
+            WaitAction(duration_ms=1), screenshot_dimensions=(1080, 2278)
+        )
+
+        self.assertEqual(result.status, ActionResultStatus.SUCCESS)
+        self.assertEqual(tools.calls, [])
+
     async def test_mcp_screenshot_has_one_bounded_retry_and_classified_failure(self):
         class OfflineMobile:
             def __init__(self):
