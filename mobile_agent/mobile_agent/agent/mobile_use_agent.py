@@ -10,16 +10,18 @@
 # limitations under the License.
 
 import asyncio
+from typing import Callable
 from mobile_agent.agent.cost.calculator import CostCalculator
-from mobile_agent.agent.mobile.doubao_action_parser import (
-    DoubaoActionSpaceParser,
+from mobile_agent.agent.llm.provider import (
+    ModelProvider,
+    create_model_provider,
 )
-from mobile_agent.agent.mobile.client import Mobile
-from mobile_agent.agent.tools.tools import Tools
+from mobile_agent.agent.mobile.backend import (
+    DeviceBackend,
+    create_device_backend,
+)
 from .infra.logger import AgentLogger
-from mobile_agent.config.settings import get_agent_config
-from mobile_agent.agent.prompt.doubao_vision_pro import doubao_system_prompt
-from mobile_agent.agent.tools.mcp import MCPHub
+from mobile_agent.config.settings import get_agent_config, get_settings
 from mobile_agent.agent.graph.builder import graph
 from mobile_agent.agent.graph.context import agent_object_manager
 
@@ -27,17 +29,28 @@ from mobile_agent.agent.graph.context import agent_object_manager
 class MobileUseAgent:
     name = "mobile_use"
 
-    def __init__(self):
-        self.prompt = doubao_system_prompt
+    def __init__(
+        self,
+        *,
+        model_provider_name: str | None = None,
+        device_provider_name: str | None = None,
+        model_provider_factory: Callable[..., ModelProvider] = create_model_provider,
+        device_backend_factory: Callable[..., DeviceBackend] = create_device_backend,
+        agent_graph=graph,
+    ):
         self.logger = AgentLogger(__name__)
 
         agent_config = get_agent_config(MobileUseAgent.name)
+        settings = get_settings()
         self.logger.info(f"agent_config: {agent_config}")
 
         self.max_steps = agent_config.max_steps
         self.step_interval = agent_config.step_interval
-        self.mcp_hub = MCPHub()
-        self.mobile_client = Mobile(self.mcp_hub)
+        self.model_provider_name = model_provider_name or settings.model_provider
+        self.device_provider_name = device_provider_name or settings.device_provider
+        self._model_provider_factory = model_provider_factory
+        self.device_backend = device_backend_factory(self.device_provider_name)
+        self._graph = agent_graph
         self.cost_calculator = CostCalculator(MobileUseAgent.name)
 
     async def initialize(
@@ -54,7 +67,7 @@ class MobileUseAgent:
         该方法默认返回self，允许链式调用
         """
         self.logger.set_context(pod_id=pod_id)
-        await self.mobile_client.initialize(
+        await self.device_backend.initialize(
             pod_id=pod_id,
             product_id=product_id,
             tos_bucket=tos_bucket,
@@ -62,12 +75,10 @@ class MobileUseAgent:
             tos_endpoint=tos_endpoint,
             auth_token=auth_token,
         )
-        self.tools = await Tools.from_mcp(self.mcp_hub)
-
         return self
 
     async def aclose(self) -> None:
-        await self.mcp_hub.aclose()
+        await self.device_backend.close()
 
     async def run(
         self,
@@ -93,15 +104,16 @@ class MobileUseAgent:
                 "max_iterations": self.max_steps,
                 "step_interval": self.step_interval,
             }
+            model_provider = self._model_provider_factory(
+                self.model_provider_name,
+                thread_id=thread_id,
+                is_stream=is_stream,
+            )
             agent_object_manager.create_context(
                 thread_id=thread_id,
-                mobile_client=self.mobile_client,
-                tools=self.tools,
+                model_provider=model_provider,
+                device_backend=self.device_backend,
                 sse_connection=sse_connection,
-                action_parser=DoubaoActionSpaceParser(
-                    phone_width=phone_width,
-                    phone_height=phone_height,
-                ),
                 cost_calculator=self.cost_calculator,
             )
 
@@ -110,7 +122,7 @@ class MobileUseAgent:
                 "recursion_limit": self.max_steps * 3,
             }
 
-            async for chunk in graph.astream(
+            async for chunk in self._graph.astream(
                 input=initial_state,
                 config=config,
                 stream_mode=["messages", "custom"],

@@ -11,6 +11,8 @@
 
 import asyncio
 import logging
+from mobile_agent.agent.actions import FailAction, FinishAction, WaitAction
+from mobile_agent.agent.llm.provider import ActionParseError
 from mobile_agent.exception.sse import SSEException
 from mobile_agent.agent.memory.context_manager import ContextManager
 from mobile_agent.agent.graph.sse_output import (
@@ -21,11 +23,12 @@ from mobile_agent.agent.graph.sse_output import (
 )
 from mobile_agent.agent.infra.message_web import (
     SSEThinkMessageData,
+    SummaryMessageData,
+    UserInterruptMessageData,
 )
 from mobile_agent.agent.graph.state import MobileUseAgentState
 import uuid
 from langgraph.config import get_stream_writer
-from mobile_agent.agent.llm.doubao import DoubaoLLM
 from mobile_agent.agent.graph.context import agent_object_manager
 
 logger = logging.getLogger(__name__)
@@ -39,7 +42,8 @@ async def prepare_node(state: MobileUseAgentState):
         thread_id, "context_manager", context_manager
     )
 
-    context_manager.add_system_message(DoubaoLLM.prompt)
+    model_provider = agent_object_manager.get_model_provider(thread_id)
+    context_manager.add_system_message(model_provider.prompt)
 
     # FIXME: 临时给一个深度思考的提示，langchain-openai 没有把豆包的think 吐出来，需要替换为 langchain-deepseek
     sse_writer = get_stream_writer()
@@ -62,12 +66,13 @@ async def prepare_node(state: MobileUseAgentState):
 async def model_node(state: MobileUseAgentState) -> MobileUseAgentState:
     """大模型节点，根据当前状态计算行动和工具调用"""
 
-    mobile = agent_object_manager.get_mobile_client(state.get("thread_id"))
+    device_backend = agent_object_manager.get_device_backend(state.get("thread_id"))
+    model_provider = agent_object_manager.get_model_provider(state.get("thread_id"))
     context_manager = agent_object_manager.get_context_manager(state.get("thread_id"))
     iteration_count = state.get("iteration_count")
 
     # 获取截图
-    screenshot_state = await mobile.take_screenshot()
+    screenshot_state = await device_backend.take_screenshot()
     state.update(screenshot=screenshot_state.get("screenshot"))
     state.update(screenshot_dimensions=screenshot_state.get("screenshot_dimensions"))
 
@@ -89,15 +94,12 @@ async def model_node(state: MobileUseAgentState) -> MobileUseAgentState:
     context_manager.keep_last_n_images_in_messages(5)
     state.update(messages=context_manager.get_messages())
 
-    # 调用模型并处理重试
-    llm = DoubaoLLM(thread_id=state.get("thread_id"), is_stream=state.get("is_stream"))
-
     # 更新步数
     cost_calculator = agent_object_manager.get_cost_calculator(state.get("thread_id"))
     cost_calculator.update_step(iteration_count)
 
     # 调用模型
-    chunk_id, content, summary, tool_call = await llm.async_chat(
+    chunk_id, content, summary, tool_call = await model_provider.async_chat(
         context_manager.get_messages()
     )
 
@@ -124,23 +126,66 @@ async def model_node(state: MobileUseAgentState) -> MobileUseAgentState:
 async def tool_valid_node(state: MobileUseAgentState) -> MobileUseAgentState:
     """工具验证节点，验证工具调用是否有效"""
     tool_call_str = state.get("tool_call_str")
-    action_parser = agent_object_manager.get_action_parser(state.get("thread_id"))
-    action_parser.change_phone_dimensions(
-        width=state.get("screenshot_dimensions")[0],
-        height=state.get("screenshot_dimensions")[1],
-    )
-    tool_call = action_parser.to_mcp_tool_call(tool_call_str)
-    state.update(tool_call=tool_call)
-
-    tools = agent_object_manager.get_tools(state.get("thread_id"))
-    tool_name = tool_call.get("name")
-
-    if tools.is_special_tool(tool_name):
+    model_provider = agent_object_manager.get_model_provider(state.get("thread_id"))
+    device_backend = agent_object_manager.get_device_backend(state.get("thread_id"))
+    try:
+        action = model_provider.parse_action(tool_call_str)
+    except ActionParseError:
+        state.update(
+            action=None,
+            tool_call={"name": "error_action", "arguments": {"content": tool_call_str}},
+            tool_output={
+                "result": "模型输出解析失败，请尝试重新按照正确的格式生成"
+            },
+        )
         sse_writer = get_stream_writer()
-        content = await tools.exec(tool_call)
-        sse_writer(format_sse(tools.get_special_message(tool_name, content, state)))
-        state.update(tool_output=tools.get_special_memory(tool_name))
+        sse_writer(
+            format_sse(
+                SSEThinkMessageData(
+                    id=state.get("chunk_id"),
+                    task_id=state.get("task_id"),
+                    role="assistant",
+                    type="think",
+                    content="模型输出解析失败，正在尝试重新生成",
+                )
+            )
+        )
         return state
+
+    tool_call = device_backend.to_tool_call(
+        action, state.get("screenshot_dimensions")
+    )
+    state.update(action=action, tool_call=tool_call)
+
+    if isinstance(action, FinishAction):
+        sse_writer = get_stream_writer()
+        sse_writer(
+            format_sse(
+                SummaryMessageData(
+                    id=state.get("chunk_id"),
+                    task_id=state.get("task_id"),
+                    role="assistant",
+                    type="summary",
+                    content=action.summary,
+                )
+            )
+        )
+        state.update(tool_output="上一轮任务已经完成，更多的根据用户新的输入完成任务")
+    elif isinstance(action, FailAction):
+        sse_writer = get_stream_writer()
+        sse_writer(
+            format_sse(
+                UserInterruptMessageData(
+                    id=state.get("chunk_id"),
+                    task_id=state.get("task_id"),
+                    role="assistant",
+                    type="user_interrupt",
+                    interrupt_type="text",
+                    content=action.reason,
+                )
+            )
+        )
+        state.update(tool_output="根据新提供的信息继续执行任务")
 
     return state
 
@@ -153,6 +198,7 @@ async def tool_node(state: MobileUseAgentState) -> MobileUseAgentState:
         raise SSEException()
 
     tool_call = state.get("tool_call")
+    action = state.get("action")
     sse_writer = get_stream_writer()
     # 写工具 input
     sse_writer(get_writer_tool_input(state, tool_call))
@@ -160,8 +206,16 @@ async def tool_node(state: MobileUseAgentState) -> MobileUseAgentState:
     logger.info(f"tool_call========: {tool_call}")
     # 检查特殊工具
     try:
-        tools = agent_object_manager.get_tools(state.get("thread_id"))
-        result = await tools.exec(tool_call)
+        if isinstance(action, WaitAction):
+            await asyncio.sleep(action.duration_ms / 1000)
+            result = f"已等待{action.duration_ms / 1000:g}s"
+        else:
+            device_backend = agent_object_manager.get_device_backend(
+                state.get("thread_id")
+            )
+            result = await device_backend.execute(
+                action, state.get("screenshot_dimensions")
+            )
         output = {
             "result": f"{tool_call['name']}:({tool_call['arguments']})\n{result}\n操作下发成功"
         }
@@ -217,13 +271,12 @@ async def should_react_continue(state: MobileUseAgentState) -> str:
 
 async def should_tool_exec_continue(state: MobileUseAgentState) -> str:
     """条件边，决定是否继续执行"""
-    tool_call = state.get("tool_call")
+    action = state.get("action")
     # 工具解析失败，重新生成action
-    if not tool_call or tool_call.get("name") == "error_action":
+    if action is None:
         return "retry"
 
-    tools = agent_object_manager.get_tools(state.get("thread_id"))
-    if tools.is_special_tool(tool_call.get("name")):
+    if isinstance(action, (FinishAction, FailAction)):
         return "finish"
 
     # 工具执行成功，继续执行

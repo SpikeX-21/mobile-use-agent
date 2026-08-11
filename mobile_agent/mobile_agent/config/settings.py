@@ -83,6 +83,12 @@ class Settings(BaseSettings):
     )
     # 环境配置
     env: str = os.environ.get("ENV", "production")
+    model_provider: str = Field(
+        default_factory=lambda: os.environ.get("MODEL_PROVIDER", "doubao")
+    )
+    device_provider: str = Field(
+        default_factory=lambda: os.environ.get("DEVICE_PROVIDER", "mcp")
+    )
     config_path: Optional[str] = Field(default=None, description="配置文件路径")
 
     llms: Dict[str, LLMConfig] = Field(default_factory=dict, description="LLM配置")

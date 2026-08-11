@@ -11,9 +11,22 @@
 
 import re
 from typing import Optional
-from mobile_agent.config.settings import MOBILE_USE_MCP_NAME
+from mobile_agent.agent.actions import (
+    BackAction,
+    CanonicalAction,
+    CloseAppAction,
+    FailAction,
+    FinishAction,
+    HomeAction,
+    LaunchAppAction,
+    ListAppsAction,
+    SwipeAction,
+    TapAction,
+    TextInputAction,
+    WaitAction,
+)
+from mobile_agent.agent.actions.mcp_adapter import canonical_action_to_mcp_tool_call
 from mobile_agent.agent.infra.model import ToolCall
-from mobile_agent.agent.utils.bbox import regular_bbox_for_ui_tars
 
 
 """
@@ -37,8 +50,8 @@ class DoubaoActionSpaceParser:
 
     def __init__(
         self,
-        phone_width: int,
-        phone_height: int,
+        phone_width: int = 1000,
+        phone_height: int = 1000,
     ):
         self.phone_width = phone_width
         self.phone_height = phone_height
@@ -64,13 +77,22 @@ class DoubaoActionSpaceParser:
 
     def to_mcp_tool_call(self, action_call: str) -> ToolCall:
         """将模型返回的操作转换为MCP工具调用"""
+        action = self.to_canonical_action(action_call)
+        if action is None:
+            return self.error_action(action_call)
+        return canonical_action_to_mcp_tool_call(
+            action, (self.phone_width, self.phone_height)
+        )
+
+    def to_canonical_action(self, action_call: str) -> CanonicalAction | None:
+        """将豆包 ActionSpace 输出转换为内部统一动作。"""
         if not action_call:
-            return self.error_action("action_call is empty")
+            return None
 
         # 解析操作类型和参数
         action_match = self.action_pattern.match(action_call)
         if not action_match:
-            return self.error_action(action_call)
+            return None
 
         action_type = action_match.group("action").lower()
         args_str = action_match.group("args").strip()
@@ -78,101 +100,74 @@ class DoubaoActionSpaceParser:
 
         # 根据操作类型处理参数
         if action_type == "click":
-            # 解析点击坐标
-            return self.__call_tap(args_pattern, args_str)
+            return self.__parse_tap(args_pattern, args_str)
         elif action_type == "type":
-            return self.__call_type(args_pattern, args_str)
+            return self.__parse_text_input(args_pattern, args_str)
         elif action_type == "drag":
-            return self.__call_swipe(args_pattern, args_str)
+            return self.__parse_swipe(args_pattern, args_str)
         elif action_type == "press_back":
-            # 返回操作
-            return {"name": f"{MOBILE_USE_MCP_NAME}:back", "arguments": {}}
+            return BackAction()
         elif action_type == "press_home":
-            # 主页操作
-            return {"name": f"{MOBILE_USE_MCP_NAME}:home", "arguments": {}}
+            return HomeAction()
         elif action_type == "close_app":
             # 关闭应用
             args_match = args_pattern.search(args_str)
             if args_match:
                 package_name = args_match.group(1)
-                return {
-                    "name": f"{MOBILE_USE_MCP_NAME}:close_app",
-                    "arguments": {"package_name": package_name},
-                }
-            return {
-                "name": f"{MOBILE_USE_MCP_NAME}:close_app",
-                "arguments": {"package_name": args_str},
-            }
+                return CloseAppAction(package_name=package_name)
+            return CloseAppAction(package_name=args_str)
         elif action_type == "launch_app":
             # 启动应用
             args_match = args_pattern.search(args_str)
             if args_match:
                 package_name = args_match.group(1)
-                return {
-                    "name": f"{MOBILE_USE_MCP_NAME}:launch_app",
-                    "arguments": {"package_name": package_name},
-                }
-            return {
-                "name": f"{MOBILE_USE_MCP_NAME}:launch_app",
-                "arguments": {"package_name": args_str},
-            }
+                return LaunchAppAction(package_name=package_name)
+            return LaunchAppAction(package_name=args_str)
         elif action_type == "list_apps":
-            # 列出所有应用
-            return {"name": f"{MOBILE_USE_MCP_NAME}:list_apps", "arguments": {}}
+            return ListAppsAction()
         elif action_type == "wait":
             # 等待操作
             args_match = args_pattern.search(args_str)
             if args_match:
                 time = int(args_match.group(1))
-                return {"name": "wait", "arguments": {"t": max(1, min(10, time))}}
-            return {"name": "wait", "arguments": {"t": 1}}
+                return WaitAction(duration_ms=max(1, min(10, time)) * 1000)
+            return WaitAction(duration_ms=1000)
         elif action_type == "call_user":
             # 呼叫用户, 后续可以增加 ux 更加好看
             args_match = args_pattern.search(args_str)
             if args_match:
                 content = args_match.group(1)
-                return {"name": "call_user", "arguments": {"content": content}}
-            return {"name": "call_user", "arguments": {"content": args_str}}
+                return FailAction(reason=content)
+            return FailAction(reason=args_str)
         elif action_type == "finish" or action_type == "finished":
             # 完成操作
             args_match = args_pattern.search(args_str)
             if args_match:
                 content = args_match.group(1)
-                return {"name": "finished", "arguments": {"content": content}}
-            return {"name": "finished", "arguments": {"content": args_str}}
+                return FinishAction(summary=content)
+            return FinishAction(summary=args_str)
 
         # 默认无法识别的操作
-        return self.error_action(action_call)
+        return None
 
-    def __call_tap(self, args_pattern: re.Pattern, args_str: str):
+    def __parse_tap(self, args_pattern: re.Pattern | None, args_str: str):
         try:
+            if args_pattern is None:
+                return None
             args_match = args_pattern.search(args_str)
             if args_match:
                 left, top, right, bottom = [
                     int(args_match.group(i)) for i in range(1, 5)
                 ]
+                return TapAction(x=(left + right) // 2, y=(top + bottom) // 2)
+        except (TypeError, ValueError):
+            return None
+        return None
 
-                left, top, right, bottom = regular_bbox_for_ui_tars(
-                    left,
-                    top,
-                    right,
-                    bottom,
-                    width=self.phone_width,
-                    height=self.phone_height,
-                )
-
-                return {
-                    "name": f"{MOBILE_USE_MCP_NAME}:tap",
-                    "arguments": {
-                        "x": (left + right) // 2,
-                        "y": (top + bottom) // 2,
-                    },
-                }
-        except Exception as e:
-            print(f"解析点击坐标失败")
-
-    def __call_swipe(self, args_pattern: re.Pattern, args_str: str):
+    def __parse_swipe(self, args_pattern: re.Pattern | None, args_str: str):
         try:
+            if args_pattern is None:
+                return None
             args_match = args_pattern.search(args_str)
             if args_match:
                 (
@@ -186,46 +181,24 @@ class DoubaoActionSpaceParser:
                     end_bottom,
                 ) = [int(args_match.group(i)) for i in range(1, 9)]
 
-                start_left, start_top, start_right, start_bottom = (
-                    regular_bbox_for_ui_tars(
-                        start_left,
-                        start_top,
-                        start_right,
-                        start_bottom,
-                        width=self.phone_width,
-                        height=self.phone_height,
-                    )
+                return SwipeAction(
+                    start_x=(start_left + start_right) // 2,
+                    start_y=(start_top + start_bottom) // 2,
+                    end_x=(end_left + end_right) // 2,
+                    end_y=(end_top + end_bottom) // 2,
                 )
+        except (TypeError, ValueError):
+            return None
+        return None
 
-                end_left, end_top, end_right, end_bottom = regular_bbox_for_ui_tars(
-                    end_left,
-                    end_top,
-                    end_right,
-                    end_bottom,
-                    width=self.phone_width,
-                    height=self.phone_height,
-                )
-
-                return {
-                    "name": f"{MOBILE_USE_MCP_NAME}:swipe",
-                    "arguments": {
-                        "from_x": ((start_left + start_right) // 2),
-                        "from_y": ((start_top + start_bottom) // 2),
-                        "to_x": ((end_left + end_right) // 2),
-                        "to_y": ((end_top + end_bottom) // 2),
-                    },
-                }
-        except Exception as e:
-            print(f"解析点击坐标失败")
-
-    def __call_type(self, args_pattern: re.Pattern, args_str: str):
+    def __parse_text_input(self, args_pattern: re.Pattern | None, args_str: str):
         try:
+            if args_pattern is None:
+                return None
             args_match = args_pattern.search(args_str)
             if args_match:
                 content = args_match.group(1)
-                return {
-                    "name": f"{MOBILE_USE_MCP_NAME}:text_input",
-                    "arguments": {"text": content},
-                }
-        except Exception as e:
-            print(f"解析失败")
+                return TextInputAction(text=content)
+        except (TypeError, ValueError):
+            return None
+        return None

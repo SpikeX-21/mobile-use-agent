@@ -12,7 +12,7 @@
 from typing import Any, Dict, Optional
 from langgraph.prebuilt.chat_agent_executor import AgentState
 from mobile_agent.agent.infra.model import ToolCall
-from mobile_agent.agent.tools.tools import Tools
+from mobile_agent.agent.actions import CanonicalAction
 
 
 class SharedState(AgentState):
@@ -26,9 +26,9 @@ class SharedState(AgentState):
 
 
 class ToolCallState(SharedState):
-    tools: Tools
     tool_call_str: Optional[str]  # 工具调用字符串
     tool_call: ToolCall  # MCP工具调用
+    action: Optional[CanonicalAction]
     tool_output: Optional[Dict[str, Any]]  # 工具调用的输出结果
     current_tool_call_id: str
 

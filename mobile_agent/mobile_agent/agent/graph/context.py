@@ -9,15 +9,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, Literal, Optional
+from typing import TYPE_CHECKING, Dict, Literal, Optional
 import asyncio
 from mobile_agent.agent.cost.calculator import CostCalculator
 from mobile_agent.agent.memory.context_manager import ContextManager
-from mobile_agent.agent.mobile.client import Mobile
-from mobile_agent.agent.tools.tools import Tools
-from mobile_agent.agent.mobile.doubao_action_parser import (
-    DoubaoActionSpaceParser,
-)
+
+if TYPE_CHECKING:
+    from mobile_agent.agent.llm.provider import ModelProvider
+    from mobile_agent.agent.mobile.backend import DeviceBackend
 
 
 class AgentObjectManager:
@@ -29,18 +28,16 @@ class AgentObjectManager:
     def create_context(
         self,
         thread_id: str,
-        mobile_client: Mobile,
-        tools: Tools,
+        model_provider: "ModelProvider",
+        device_backend: "DeviceBackend",
         sse_connection: asyncio.Event,
-        action_parser: DoubaoActionSpaceParser,
         cost_calculator: CostCalculator,
     ):
         """为特定thread_id创建上下文"""
         self._contexts[thread_id] = {
-            "mobile_client": mobile_client,
-            "tools": tools,
+            "model_provider": model_provider,
+            "device_backend": device_backend,
             "sse_connection": sse_connection,
-            "action_parser": action_parser,
             "cost_calculator": cost_calculator,
         }
 
@@ -56,17 +53,14 @@ class AgentObjectManager:
     def get_context_manager(self, thread_id: str) -> Optional[ContextManager]:
         return self._contexts.get(thread_id, {}).get("context_manager")
 
-    def get_mobile_client(self, thread_id: str) -> Optional[Mobile]:
-        return self._contexts.get(thread_id, {}).get("mobile_client")
+    def get_model_provider(self, thread_id: str) -> Optional["ModelProvider"]:
+        return self._contexts.get(thread_id, {}).get("model_provider")
 
-    def get_tools(self, thread_id: str) -> Optional[Tools]:
-        return self._contexts.get(thread_id, {}).get("tools")
+    def get_device_backend(self, thread_id: str) -> Optional["DeviceBackend"]:
+        return self._contexts.get(thread_id, {}).get("device_backend")
 
     def get_sse_connection(self, thread_id: str) -> Optional[asyncio.Event]:
         return self._contexts.get(thread_id, {}).get("sse_connection")
-
-    def get_action_parser(self, thread_id: str) -> Optional[DoubaoActionSpaceParser]:
-        return self._contexts.get(thread_id, {}).get("action_parser")
 
     def get_cost_calculator(self, thread_id: str) -> Optional[CostCalculator]:
         return self._contexts.get(thread_id, {}).get("cost_calculator")
