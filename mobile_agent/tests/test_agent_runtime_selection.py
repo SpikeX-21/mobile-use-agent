@@ -15,7 +15,7 @@ import asyncio
 import unittest
 import uuid
 
-from mobile_agent.agent.actions import FailAction, WaitAction
+from mobile_agent.agent.actions import FailAction, FinishAction, WaitAction
 from mobile_agent.agent.actions.mcp_adapter import canonical_action_to_mcp_tool_call
 from mobile_agent.agent.graph.context import agent_object_manager
 from mobile_agent.agent.llm.provider import DoubaoModelProvider
@@ -112,6 +112,32 @@ class CanonicalSequenceProvider:
 
     def parse_action(self, action_call):
         return self.actions.pop(0)
+
+
+class RepeatedFinishProvider:
+    name = "repeated-finish"
+    prompt = "fake prompt"
+    supports_streaming = False
+
+    def __init__(self):
+        self.calls = 0
+
+    async def async_chat(self, messages):
+        self.calls += 1
+        return (f"finish-{self.calls}", "finish", "finish", "finish")
+
+    def parse_action(self, action_call):
+        return FinishAction(summary="model says complete")
+
+
+class RejectingCompletionBackend(FakeMcpBackend):
+    def __init__(self):
+        super().__init__()
+        self.oracle_calls = 0
+
+    async def verify_completion(self, action):
+        self.oracle_calls += 1
+        return False
 
 
 class AgentRuntimeSelectionTests(unittest.IsolatedAsyncioTestCase):
@@ -273,6 +299,43 @@ class AgentRuntimeSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"tool_name": "wait"', custom_output)
         self.assertIn('"type": "user_interrupt"', custom_output)
         self.assertIn('"content": "请登录"', custom_output)
+
+    async def test_repeated_oracle_failure_stops_after_two_checks(self):
+        backend = RejectingCompletionBackend()
+        provider = RepeatedFinishProvider()
+        agent = MobileUseAgent(
+            model_provider_name="kimi",
+            device_provider_name="adb",
+            model_provider_factory=lambda *args, **kwargs: provider,
+            device_backend_factory=lambda name: backend,
+        )
+        agent.step_interval = 0
+        await agent.initialize("", "", "", "", "", "")
+
+        chunks = [
+            chunk
+            async for chunk in agent.run(
+                "打开高德地图",
+                is_stream=False,
+                task_id="task-oracle-failure",
+                session_id="session-oracle-failure",
+                thread_id=f"chat-{uuid.uuid4()}",
+                sse_connection=asyncio.Event(),
+                phone_width=1080,
+                phone_height=2278,
+            )
+        ]
+        custom_output = "\n".join(
+            chunk[1]
+            for chunk in chunks
+            if isinstance(chunk, tuple)
+            and chunk[0] == "custom"
+            and isinstance(chunk[1], str)
+        )
+
+        self.assertEqual(provider.calls, 2)
+        self.assertEqual(backend.oracle_calls, 2)
+        self.assertIn("ADB 前台应用连续两次未满足完成条件", custom_output)
 
 
 if __name__ == "__main__":

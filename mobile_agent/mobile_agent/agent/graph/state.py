@@ -23,6 +23,7 @@ class SharedState(AgentState):
     is_stream: bool  # 是否流式输出
     iteration_count: int  # 当前迭代次数
     max_iterations: int  # 最大迭代次数
+    oracle_failure_count: int  # 连续完成条件校验失败次数
 
 
 class ToolCallState(SharedState):

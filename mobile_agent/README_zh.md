@@ -79,6 +79,38 @@ ACEP_SK= # 火山引擎 SK
 ACEP_ACCOUNT_ID= # 火山引擎 账号ID
 ```
 
+### Kimi K2.6 + ADB 视觉点击 Demo
+
+Issue #3 的最小链路不依赖 Go MCP 执行动作。先确保 `adb devices` 中目标设备状态为
+`device`，再在 `.env` 中配置：
+
+```dotenv
+MODEL_PROVIDER=kimi
+KIMI_API_KEY=<仅保存在本机的密钥>
+KIMI_MODEL=kimi-k2.6
+KIMI_BASE_URL=https://api.moonshot.cn/v1
+KIMI_THINKING_MODE=disabled
+
+DEVICE_PROVIDER=adb
+ADB_SERIAL=<设备地址或序列号>
+ADB_VENDOR_KEYS=<ADB 私钥路径，可在 adb server 已加载密钥时留空>
+ADB_COMMAND_TIMEOUT=10
+ADB_ORACLE_PACKAGE=com.autonavi.minimap
+```
+
+也兼容用 `OPENAI_BASE_URL` 提供接口地址；若同时设置，`KIMI_BASE_URL` 优先。
+启动方式不变：
+
+```bash
+conda activate mobile-use-agent
+python main.py
+```
+
+该 Demo 每轮通过 `adb exec-out screencap -p` 获取截图，以 Base64 发送给 Kimi，
+并只将视觉识别产生的 `tap` 下发为 ADB 点击。坐标采用 0–1000 归一化格式，
+执行前会按截图尺寸转换为像素。高德地图验收可用
+`adb shell dumpsys window` 独立确认前台包是否为 `com.autonavi.minimap`。
+
 ## 🛠️ 核心组件
 
 通过 Mobile Use MCP 支持的移动设备操作：

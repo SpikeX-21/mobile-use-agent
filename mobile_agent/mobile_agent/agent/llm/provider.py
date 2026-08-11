@@ -21,7 +21,6 @@ from mobile_agent.agent.llm.doubao import DoubaoLLM
 from mobile_agent.agent.mobile.doubao_action_parser import DoubaoActionSpaceParser
 from mobile_agent.agent.prompt.doubao_vision_pro import doubao_system_prompt
 from mobile_agent.agent.provider import (
-    ProviderNotImplementedError,
     UnknownProviderError,
 )
 
@@ -33,6 +32,7 @@ class ActionParseError(ValueError):
 class ModelProvider(Protocol):
     name: str
     prompt: str
+    supports_streaming: bool
 
     async def async_chat(
         self, messages: Sequence[BaseMessage]
@@ -44,6 +44,7 @@ class ModelProvider(Protocol):
 class DoubaoModelProvider:
     name = "doubao"
     prompt = doubao_system_prompt
+    supports_streaming = True
 
     def __init__(
         self,
@@ -87,7 +88,10 @@ def create_model_provider(
             **dependencies,
         )
     if normalized_name == "kimi":
-        raise ProviderNotImplementedError(
-            "Model provider 'kimi' is not implemented; complete issue #3 first"
-        )
+        from mobile_agent.agent.llm.kimi import KimiModelProvider
+        from mobile_agent.config.settings import get_settings
+
+        if "config" not in dependencies:
+            dependencies["config"] = get_settings().get_kimi_config()
+        return KimiModelProvider(thread_id=thread_id, **dependencies)
     raise UnknownProviderError(f"Unknown model provider: {provider_name!r}")

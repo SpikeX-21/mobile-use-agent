@@ -14,8 +14,8 @@ import json
 import re
 import tomli
 from pathlib import Path
-from typing import Dict, Optional
-from pydantic import BaseModel, Field, ValidationError
+from typing import Dict, Literal, Optional
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 from pydantic_settings import BaseSettings
 import logging
 from dotenv import load_dotenv
@@ -50,6 +50,24 @@ class LLMConfig(BaseModel):
     base_url: str = ""
     max_tokens: Optional[int] = None
     temperature: float = 0.0
+
+
+class KimiConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    api_key: SecretStr
+    model: str = "kimi-k2.6"
+    base_url: str = "https://api.moonshot.cn/v1"
+    thinking_mode: Literal["disabled"] = "disabled"
+
+
+class AdbConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    serial: str
+    vendor_keys: SecretStr | None = None
+    command_timeout: float = Field(default=10.0, gt=0)
+    oracle_package: str = "com.autonavi.minimap"
 
 
 class MCPConfig(BaseModel):
@@ -89,6 +107,42 @@ class Settings(BaseSettings):
     device_provider: str = Field(
         default_factory=lambda: os.environ.get("DEVICE_PROVIDER", "mcp")
     )
+    kimi_api_key: SecretStr | None = Field(
+        default_factory=lambda: (
+            SecretStr(os.environ["KIMI_API_KEY"])
+            if os.environ.get("KIMI_API_KEY")
+            else None
+        )
+    )
+    kimi_model: str = Field(
+        default_factory=lambda: os.environ.get("KIMI_MODEL", "kimi-k2.6")
+    )
+    kimi_base_url: str = Field(
+        default_factory=lambda: os.environ.get("KIMI_BASE_URL")
+        or os.environ.get("OPENAI_BASE_URL")
+        or "https://api.moonshot.cn/v1"
+    )
+    kimi_thinking_mode: str = Field(
+        default_factory=lambda: os.environ.get("KIMI_THINKING_MODE", "disabled")
+    )
+    adb_serial: str | None = Field(
+        default_factory=lambda: os.environ.get("ADB_SERIAL")
+    )
+    adb_vendor_keys: SecretStr | None = Field(
+        default_factory=lambda: (
+            SecretStr(os.environ["ADB_VENDOR_KEYS"])
+            if os.environ.get("ADB_VENDOR_KEYS")
+            else None
+        )
+    )
+    adb_command_timeout: float = Field(
+        default_factory=lambda: float(os.environ.get("ADB_COMMAND_TIMEOUT", "10"))
+    )
+    adb_oracle_package: str = Field(
+        default_factory=lambda: os.environ.get(
+            "ADB_ORACLE_PACKAGE", "com.autonavi.minimap"
+        )
+    )
     config_path: Optional[str] = Field(default=None, description="配置文件路径")
 
     llms: Dict[str, LLMConfig] = Field(default_factory=dict, description="LLM配置")
@@ -107,6 +161,34 @@ class Settings(BaseSettings):
     class Config:
         env_prefix = "MOBILE_"  # 环境变量前缀
         case_sensitive = False
+
+    def get_kimi_config(self) -> KimiConfig:
+        from mobile_agent.agent.provider import ProviderConfigurationError
+
+        if self.kimi_api_key is None:
+            raise ProviderConfigurationError(
+                "Kimi provider requires environment variable KIMI_API_KEY"
+            )
+        return KimiConfig(
+            api_key=self.kimi_api_key,
+            model=self.kimi_model,
+            base_url=self.kimi_base_url,
+            thinking_mode=self.kimi_thinking_mode,
+        )
+
+    def get_adb_config(self) -> AdbConfig:
+        from mobile_agent.agent.provider import ProviderConfigurationError
+
+        if not self.adb_serial:
+            raise ProviderConfigurationError(
+                "ADB provider requires environment variable ADB_SERIAL"
+            )
+        return AdbConfig(
+            serial=self.adb_serial,
+            vendor_keys=self.adb_vendor_keys,
+            command_timeout=self.adb_command_timeout,
+            oracle_package=self.adb_oracle_package,
+        )
 
     def _replace_env_vars(self, config_data):
         """递归替换配置中的环境变量占位符 比如${ARK_API_KEY} 变成 环境变量中的值"""

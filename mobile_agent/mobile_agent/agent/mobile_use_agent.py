@@ -102,6 +102,7 @@ class MobileUseAgent:
                 "thread_id": thread_id,
                 "is_stream": is_stream,
                 "max_iterations": self.max_steps,
+                "oracle_failure_count": 0,
                 "step_interval": self.step_interval,
             }
             model_provider = self._model_provider_factory(

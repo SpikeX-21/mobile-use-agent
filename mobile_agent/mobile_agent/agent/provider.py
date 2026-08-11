@@ -15,3 +15,7 @@ class UnknownProviderError(ValueError):
 
 class ProviderNotImplementedError(NotImplementedError):
     """The provider is recognized but intentionally unavailable."""
+
+
+class ProviderConfigurationError(ValueError):
+    """A selected provider is missing required configuration."""

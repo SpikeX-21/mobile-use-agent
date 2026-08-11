@@ -17,12 +17,12 @@ from unittest.mock import patch
 
 from mobile_agent.agent.llm.provider import (
     DoubaoModelProvider,
-    ProviderNotImplementedError,
     UnknownProviderError,
     create_model_provider,
 )
+from mobile_agent.agent.provider import ProviderConfigurationError, ProviderNotImplementedError
 from mobile_agent.agent.mobile.backend import McpDeviceBackend, create_device_backend
-from mobile_agent.config.settings import Settings
+from mobile_agent.config.settings import AdbConfig, KimiConfig, Settings
 
 
 class ProviderSelectionTests(unittest.TestCase):
@@ -58,6 +58,32 @@ class ProviderSelectionTests(unittest.TestCase):
             ProviderNotImplementedError, "vendor_mcp.*not implemented"
         ):
             create_device_backend("vendor_mcp")
+
+    def test_kimi_and_adb_factories_accept_explicit_test_dependencies(self):
+        kimi = create_model_provider(
+            "kimi",
+            thread_id="thread-1",
+            is_stream=True,
+            config=KimiConfig(api_key="fake-key"),
+            client=object(),
+        )
+        adb = create_device_backend(
+            "adb",
+            config=AdbConfig(serial="device-1"),
+            runner=object(),
+        )
+
+        self.assertEqual(kimi.name, "kimi")
+        self.assertEqual(adb.name, "adb")
+
+    def test_selected_provider_errors_name_missing_env_without_secret_values(self):
+        with patch.dict(os.environ, {}, clear=True):
+            selected = Settings(model_provider="kimi", device_provider="adb")
+
+        with self.assertRaisesRegex(ProviderConfigurationError, "KIMI_API_KEY"):
+            selected.get_kimi_config()
+        with self.assertRaisesRegex(ProviderConfigurationError, "ADB_SERIAL"):
+            selected.get_adb_config()
 
     def test_unknown_providers_do_not_silently_fall_back(self):
         with self.assertRaises(UnknownProviderError):

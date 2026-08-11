@@ -105,8 +105,8 @@ async def model_node(state: MobileUseAgentState) -> MobileUseAgentState:
 
     logger.info(f"content========: {content}")
 
-    if not state.get("is_stream"):
-        # 非流式传输直接突出对应的summary
+    if not state.get("is_stream") or not model_provider.supports_streaming:
+        # 请求或模型适配器不支持流式时，直接输出对应 summary。
         sse_writer = get_stream_writer()
         sse_writer(get_writer_think(state, chunk_id, summary))
 
@@ -152,9 +152,46 @@ async def tool_valid_node(state: MobileUseAgentState) -> MobileUseAgentState:
         )
         return state
 
-    tool_call = device_backend.to_tool_call(
-        action, state.get("screenshot_dimensions")
-    )
+
+    verify_completion = getattr(device_backend, "verify_completion", None)
+    if isinstance(action, FinishAction) and callable(verify_completion):
+        if await verify_completion(action) is False:
+            oracle_failure_count = state.get("oracle_failure_count", 0) + 1
+            if oracle_failure_count >= 2:
+                action = FailAction(reason="ADB 前台应用连续两次未满足完成条件")
+                state.update(oracle_failure_count=oracle_failure_count)
+            else:
+                state.update(
+                    action=None,
+                    oracle_failure_count=oracle_failure_count,
+                    tool_call={
+                        "name": "error_action",
+                        "arguments": {"content": "completion oracle not satisfied"},
+                    },
+                    tool_output={
+                        "result": "ADB 前台应用校验未通过，请根据最新截图继续操作"
+                    },
+                )
+                return state
+        else:
+            state.update(oracle_failure_count=0)
+
+    try:
+        tool_call = device_backend.to_tool_call(
+            action, state.get("screenshot_dimensions")
+        )
+    except (NotImplementedError, TypeError, ValueError) as exc:
+        state.update(
+            action=None,
+            tool_call={
+                "name": "error_action",
+                "arguments": {"content": type(exc).__name__},
+            },
+            tool_output={
+                "result": "当前设备后端不支持该动作，请仅使用已声明的动作重新生成"
+            },
+        )
+        return state
     state.update(action=action, tool_call=tool_call)
 
     if isinstance(action, FinishAction):

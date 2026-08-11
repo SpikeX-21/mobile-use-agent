@@ -44,6 +44,8 @@ class DeviceBackend(Protocol):
         screenshot_dimensions: tuple[int, int],
     ) -> ToolCall: ...
 
+    async def verify_completion(self, action: CanonicalAction) -> bool | None: ...
+
     async def close(self) -> None: ...
 
 
@@ -87,15 +89,21 @@ class McpDeviceBackend:
     async def close(self) -> None:
         await self._mcp_hub.aclose()
 
+    async def verify_completion(self, action: CanonicalAction) -> bool | None:
+        return None
+
 
 def create_device_backend(provider_name: str, **dependencies: Any) -> DeviceBackend:
     normalized_name = provider_name.strip().lower()
     if normalized_name == "mcp":
         return McpDeviceBackend(**dependencies)
     if normalized_name == "adb":
-        raise ProviderNotImplementedError(
-            "Device provider 'adb' is not implemented; complete issue #3 first"
-        )
+        from mobile_agent.agent.mobile.adb import AdbDeviceBackend
+        from mobile_agent.config.settings import get_settings
+
+        if "config" not in dependencies:
+            dependencies["config"] = get_settings().get_adb_config()
+        return AdbDeviceBackend(**dependencies)
     if normalized_name == "vendor_mcp":
         raise ProviderNotImplementedError(
             "Device provider 'vendor_mcp' is not implemented"
