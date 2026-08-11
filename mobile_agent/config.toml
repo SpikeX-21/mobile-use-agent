@@ -1,0 +1,15 @@
+app_name = "Mobile Use Agent"
+app_version = "1.0.0"
+
+
+[llms."doubao-vision-pro-thinking-1.5"]
+model = "${ARK_MODEL_ID}"
+base_url = "https://ark.cn-beijing.volces.com/api/v3"
+api_key = "${ARK_API_KEY}"
+
+[agents."mobile_use"]
+name = "mobile_use agent"
+modelKey = "doubao-vision-pro-thinking-1.5"
+max_steps = 256
+input_price_per_1k = 0.0030
+output_price_per_1k = 0.0090

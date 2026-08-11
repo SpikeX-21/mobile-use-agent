@@ -1,0 +1,29 @@
+[project]
+name = "mobile-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.12",
+    "mcp>=1.9.4",
+    "tomli>=2.2.1",
+    "pydantic>=2.11.4",
+    "uvicorn>=0.34.2",
+    "langgraph>=0.4.5",
+    "langchain-mcp-adapters>=0.1.0",
+    "httpx>=0.28.1",
+    "pillow>=11.2.1",
+    "openai>=1.90.0",
+    "langchain>=0.3.25",
+    "langchain-openai>=0.3.24",
+    "volcengine>=1.0.190",
+]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]               # 改为根目录
+include = ["mobile_agent*"] # 只包含 mobile_agent 包

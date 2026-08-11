@@ -1,0 +1,30 @@
+// Copyright (c) 2025 Bytedance Ltd. and/or its affiliates
+// Licensed under the 【火山方舟】原型应用软件自用许可协议
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at 
+//     https://www.volcengine.com/docs/82379/1433703
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+export class APIError extends Error {
+  static readonly TYPE = 'API_ERROR';
+  readonly type = APIError.TYPE;
+
+  get code(): number {
+    return this._code;
+  }
+
+  get originMsg(): string {
+    return this._message;
+  }
+
+  constructor(private _code: number, private _message: string) {
+    const ERROR_MESSAGES: { [key: number]: string } = {
+      [2001]: '当前账号已占用实例体验中，请稍后再试',
+    }
+    super(ERROR_MESSAGES[_code] || _message);
+  }
+}
