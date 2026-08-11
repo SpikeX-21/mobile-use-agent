@@ -103,6 +103,39 @@ class CanonicalActionTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             validate_canonical_action({"type": "text_input", "text": ""})
 
+    def test_swipe_strictly_validates_coordinates_and_duration(self):
+        invalid_swipes = [
+            {
+                "type": "swipe",
+                "start_x": 500,
+                "start_y": 1001,
+                "end_x": 500,
+                "end_y": 200,
+                "duration_ms": 300,
+            },
+            {
+                "type": "swipe",
+                "start_x": "500",
+                "start_y": 800,
+                "end_x": 500,
+                "end_y": 200,
+                "duration_ms": 300,
+            },
+            {
+                "type": "swipe",
+                "start_x": 500,
+                "start_y": 800,
+                "end_x": 500,
+                "end_y": 200,
+                "duration_ms": 0,
+            },
+        ]
+
+        for action in invalid_swipes:
+            with self.subTest(action=action):
+                with self.assertRaises(ValidationError):
+                    validate_canonical_action(action)
+
 
 if __name__ == "__main__":
     unittest.main()

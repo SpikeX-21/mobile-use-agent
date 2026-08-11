@@ -81,7 +81,7 @@ ACEP_ACCOUNT_ID= # 火山引擎 账号ID
 
 ### Kimi K2.6 + ADB 视觉点击 Demo
 
-Issue #5 的多步 Demo 不依赖 Go MCP 执行动作。先确保 `adb devices` 中目标设备状态为
+Issue #6 的多步 Demo 不依赖 Go MCP 执行动作。先确保 `adb devices` 中目标设备状态为
 `device`，再在 `.env` 中配置：
 
 ```dotenv
@@ -107,7 +107,7 @@ python main.py
 ```
 
 该 Demo 每轮通过 `adb exec-out screencap -p` 获取截图，以 Base64 发送给 Kimi，
-并支持将 `tap`、`text_input`、`clear_text` 和 `wait` 下发给 ADB Backend。
+并支持将 `tap`、`swipe`、`text_input`、`clear_text` 和 `wait` 下发给 ADB Backend。
 坐标采用 0–1000 归一化格式，执行前会按截图尺寸转换为像素。安全 ASCII 文本使用
 `adb shell input text`；中文和特殊字符使用 Android UTF-8 剪贴板及
 `KEYCODE_PASTE`，避免依赖已废弃的云手机私有广播。清空文本使用 Ctrl+A 后删除。
@@ -115,7 +115,10 @@ python main.py
 每个任务开始前会强制停止高德地图并返回桌面，但不会执行 `pm clear`。任务完成由
 独立 Oracle 验证：`adb shell dumpsys window` 必须确认前台包为
 `com.autonavi.minimap`，搜索“上海外滩”场景还会读取 UI hierarchy，要求目标文本
-真实可见。完整任务最多执行十步，并且不需要人工点击。
+真实可见。打开首个搜索结果场景使用压缩 UI hierarchy，要求详情页同时出现精确的
+语义标题节点与收藏按钮；搜索框文字或结果列表不能被误判为详情页。压缩读取可避免
+复杂详情页的非压缩 hierarchy 被设备系统杀死。完整任务最多执行十步，并且不需要
+人工点击。
 
 动作执行结果统一分为 `success`、`failed` 和 `ambiguous`。点击、滑动、输入、
 按键及应用生命周期操作发生超时时不会自动重放，而是标记为 `ambiguous`，

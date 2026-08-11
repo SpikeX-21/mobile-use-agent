@@ -20,6 +20,7 @@ from mobile_agent.agent.actions import (
     ClearTextAction,
     FailAction,
     FinishAction,
+    SwipeAction,
     TapAction,
     TextInputAction,
     WaitAction,
@@ -46,6 +47,24 @@ class AdbCommandResult:
     stdout: bytes = b""
     stderr: bytes = b""
     returncode: int = 0
+
+
+@dataclass(frozen=True)
+class AdbCompletionExpectation:
+    required_text: str | None = None
+    detail_page: bool = False
+
+    @classmethod
+    def from_user_prompt(cls, user_prompt: str) -> "AdbCompletionExpectation":
+        detail_page = bool(
+            re.search(r"(?:第一个|首个|第一条)(?:搜索)?结果", user_prompt)
+        )
+        if "上海外滩" not in user_prompt:
+            return cls(detail_page=detail_page)
+        return cls(
+            required_text="外滩" if detail_page else "上海外滩",
+            detail_page=detail_page,
+        )
 
 
 class AdbRunner(Protocol):
@@ -128,7 +147,7 @@ class AdbDeviceBackend:
     def __init__(self, config: AdbConfig, runner: AdbRunner | None = None):
         self.config = config
         self._runner = runner or SubprocessAdbRunner(config)
-        self._current_user_prompt = ""
+        self._completion_expectation = AdbCompletionExpectation()
 
     async def initialize(self, **connection: str) -> None:
         result = await self._runner.run("-s", self.config.serial, "get-state")
@@ -139,7 +158,9 @@ class AdbDeviceBackend:
             )
 
     async def prepare_task(self, user_prompt: str) -> None:
-        self._current_user_prompt = user_prompt
+        self._completion_expectation = AdbCompletionExpectation.from_user_prompt(
+            user_prompt
+        )
         await self._runner.run(
             "-s",
             self.config.serial,
@@ -207,6 +228,18 @@ class AdbDeviceBackend:
                     "y": _to_pixel(action.y, height),
                 },
             }
+        if isinstance(action, SwipeAction):
+            width, height = screenshot_dimensions
+            return {
+                "name": "mobile:swipe",
+                "arguments": {
+                    "from_x": _to_pixel(action.start_x, width),
+                    "from_y": _to_pixel(action.start_y, height),
+                    "to_x": _to_pixel(action.end_x, width),
+                    "to_y": _to_pixel(action.end_y, height),
+                    "duration_ms": action.duration_ms,
+                },
+            }
         if isinstance(action, TextInputAction):
             return {
                 "name": "mobile:text_input",
@@ -246,6 +279,19 @@ class AdbDeviceBackend:
                     "tap",
                     str(arguments["x"]),
                     str(arguments["y"]),
+                )
+            elif isinstance(action, SwipeAction):
+                await self._runner.run(
+                    "-s",
+                    self.config.serial,
+                    "shell",
+                    "input",
+                    "swipe",
+                    str(arguments["from_x"]),
+                    str(arguments["from_y"]),
+                    str(arguments["to_x"]),
+                    str(arguments["to_y"]),
+                    str(arguments["duration_ms"]),
                 )
             elif isinstance(action, TextInputAction):
                 await self._input_text(action.text)
@@ -316,12 +362,12 @@ class AdbDeviceBackend:
     async def verify_completion(self, action: CanonicalAction) -> bool | None:
         if not isinstance(action, FinishAction):
             return None
-        required_text = (
-            "上海外滩" if "上海外滩" in self._current_user_prompt else None
-        )
         oracle = AdbTaskOracle(self.config, runner=self._runner)
         try:
-            return await oracle.is_complete(required_text=required_text)
+            return await oracle.is_complete(
+                required_text=self._completion_expectation.required_text,
+                detail_page=self._completion_expectation.detail_page,
+            )
         except AdbCommandError:
             return False
 
@@ -359,13 +405,18 @@ class AdbTaskOracle:
         self._config = config
         self._runner = runner or SubprocessAdbRunner(config)
 
-    async def is_complete(self, required_text: str | None = None) -> bool:
+    async def is_complete(
+        self,
+        required_text: str | None = None,
+        *,
+        detail_page: bool = False,
+    ) -> bool:
         foreground_oracle = AdbForegroundAppOracle(
             self._config, runner=self._runner
         )
         if not await foreground_oracle.is_foreground():
             return False
-        if required_text is None:
+        if required_text is None and not detail_page:
             return True
 
         result = await self._runner.run(
@@ -374,6 +425,7 @@ class AdbTaskOracle:
             "exec-out",
             "uiautomator",
             "dump",
+            "--compressed",
             "/dev/tty",
         )
         output = result.stdout.decode("utf-8", errors="replace")
@@ -385,9 +437,34 @@ class AdbTaskOracle:
             hierarchy = ET.fromstring(xml_document)
         except ET.ParseError:
             return False
-        return any(
-            required_text in node.attrib.get(attribute, "")
+        visible_nodes = [
+            node
             for node in hierarchy.iter()
             if node.attrib.get("visible-to-user", "true").lower() != "false"
+        ]
+        visible_values = [
+            node.attrib.get(attribute, "")
+            for node in visible_nodes
             for attribute in ("text", "content-desc")
-        )
+            if node.attrib.get(attribute, "")
+        ]
+        if required_text is not None:
+            target_is_visible = (
+                any(
+                    node.attrib.get("content-desc") == required_text
+                    and node.attrib.get("class") == "android.view.ViewGroup"
+                    and node.attrib.get("clickable") == "true"
+                    and node.attrib.get("long-clickable") == "true"
+                    for node in visible_nodes
+                )
+                if detail_page
+                else any(required_text in value for value in visible_values)
+            )
+            if not target_is_visible:
+                return False
+        if not detail_page:
+            return True
+        # Compressed hierarchies omit non-focusable child labels such as the
+        # visible "导航" and "路线" text.  The exact semantic title node plus
+        # the detail-only favourite control remains stable device evidence.
+        return any(value.startswith("收藏按钮") for value in visible_values)

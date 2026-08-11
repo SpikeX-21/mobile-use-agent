@@ -17,6 +17,7 @@ from pydantic import SecretStr
 from mobile_agent.agent.actions import (
     ClearTextAction,
     FinishAction,
+    SwipeAction,
     TapAction,
     TextInputAction,
     WaitAction,
@@ -138,6 +139,52 @@ class AdbDeviceBackendTests(unittest.IsolatedAsyncioTestCase):
             [("-s", "device-1", "shell", "input", "tap", "1079", "1200")],
         )
 
+    async def test_swipe_converts_all_normalized_coordinates_and_duration(self):
+        runner = RecordingRunner([AdbCommandResult()])
+        backend = AdbDeviceBackend(self.make_config(), runner=runner)
+        action = SwipeAction(
+            start_x=500,
+            start_y=800,
+            end_x=500,
+            end_y=200,
+            duration_ms=450,
+        )
+
+        tool_call = backend.to_tool_call(action, (1080, 2400))
+        result = await backend.execute(action, (1080, 2400))
+
+        self.assertEqual(result.status, ActionResultStatus.SUCCESS)
+        self.assertEqual(
+            tool_call,
+            {
+                "name": "mobile:swipe",
+                "arguments": {
+                    "from_x": 540,
+                    "from_y": 1920,
+                    "to_x": 540,
+                    "to_y": 480,
+                    "duration_ms": 450,
+                },
+            },
+        )
+        self.assertEqual(
+            runner.calls,
+            [
+                (
+                    "-s",
+                    "device-1",
+                    "shell",
+                    "input",
+                    "swipe",
+                    "540",
+                    "1920",
+                    "540",
+                    "480",
+                    "450",
+                )
+            ],
+        )
+
     async def test_side_effect_timeout_is_ambiguous_and_is_not_replayed(self):
         class TimingOutRunner:
             def __init__(self):
@@ -153,6 +200,33 @@ class AdbDeviceBackendTests(unittest.IsolatedAsyncioTestCase):
         backend = AdbDeviceBackend(self.make_config(), runner=runner)
 
         result = await backend.execute(TapAction(x=500, y=500), (1080, 2400))
+
+        self.assertEqual(result.status, ActionResultStatus.AMBIGUOUS)
+        self.assertEqual(result.error_kind, DeviceErrorKind.TIMEOUT)
+        self.assertEqual(len(runner.calls), 1)
+
+    async def test_swipe_timeout_is_ambiguous_and_is_not_replayed(self):
+        class TimingOutRunner:
+            def __init__(self):
+                self.calls = []
+
+            async def run(self, *arguments):
+                self.calls.append(arguments)
+                raise AdbCommandError(
+                    "ADB command timed out", kind=DeviceErrorKind.TIMEOUT
+                )
+
+        runner = TimingOutRunner()
+        backend = AdbDeviceBackend(self.make_config(), runner=runner)
+        action = SwipeAction(
+            start_x=500,
+            start_y=800,
+            end_x=500,
+            end_y=200,
+            duration_ms=300,
+        )
+
+        result = await backend.execute(action, (1080, 2400))
 
         self.assertEqual(result.status, ActionResultStatus.AMBIGUOUS)
         self.assertEqual(result.error_kind, DeviceErrorKind.TIMEOUT)
@@ -358,7 +432,15 @@ class AdbDeviceBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await oracle.is_complete(required_text="上海外滩"))
         self.assertEqual(
             runner.calls[-1],
-            ("-s", "device-1", "exec-out", "uiautomator", "dump", "/dev/tty"),
+            (
+                "-s",
+                "device-1",
+                "exec-out",
+                "uiautomator",
+                "dump",
+                "--compressed",
+                "/dev/tty",
+            ),
         )
 
     async def test_search_oracle_rejects_foreground_app_without_visible_query_text(self):
@@ -394,6 +476,128 @@ class AdbDeviceBackendTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(await oracle.is_complete(required_text="上海外滩"))
 
+    async def test_detail_oracle_requires_target_and_stable_detail_controls(self):
+        runner = RecordingRunner(
+            [
+                AdbCommandResult(
+                    stdout=b"mCurrentFocus=Window{1 u0 com.autonavi.minimap/.MapActivity}"
+                ),
+                AdbCommandResult(
+                    stdout=(
+                        "<hierarchy>"
+                        "<node class='android.view.ViewGroup' content-desc='外滩' "
+                        "clickable='true' long-clickable='true' />"
+                        "<node content-desc='收藏按钮未收藏' />"
+                        "<node text='导航' />"
+                        "<node text='路线' />"
+                        "</hierarchy>"
+                    ).encode("utf-8")
+                ),
+            ]
+        )
+        oracle = AdbTaskOracle(self.make_config(), runner=runner)
+
+        self.assertTrue(
+            await oracle.is_complete(required_text="外滩", detail_page=True)
+        )
+
+    async def test_detail_oracle_accepts_compressed_real_device_evidence(self):
+        runner = RecordingRunner(
+            [
+                AdbCommandResult(
+                    stdout=b"mCurrentFocus=Window{1 u0 com.autonavi.minimap/.MapActivity}"
+                ),
+                AdbCommandResult(
+                    stdout=(
+                        "<hierarchy>"
+                        "<node class='android.view.ViewGroup' content-desc='外滩' "
+                        "clickable='true' long-clickable='true' />"
+                        "<node class='android.view.ViewGroup' "
+                        "content-desc='收藏按钮未收藏' clickable='true' />"
+                        "</hierarchy>"
+                    ).encode("utf-8")
+                ),
+            ]
+        )
+        oracle = AdbTaskOracle(self.make_config(), runner=runner)
+
+        self.assertTrue(
+            await oracle.is_complete(required_text="外滩", detail_page=True)
+        )
+
+    async def test_detail_oracle_rejects_search_result_list(self):
+        runner = RecordingRunner(
+            [
+                AdbCommandResult(
+                    stdout=b"mCurrentFocus=Window{1 u0 com.autonavi.minimap/.MapActivity}"
+                ),
+                AdbCommandResult(
+                    stdout=(
+                        "<hierarchy>"
+                        "<node content-desc='外滩' clickable='true' />"
+                        "<node content-desc='路线' clickable='true' />"
+                        "</hierarchy>"
+                    ).encode("utf-8")
+                ),
+            ]
+        )
+        oracle = AdbTaskOracle(self.make_config(), runner=runner)
+
+        self.assertFalse(
+            await oracle.is_complete(required_text="外滩", detail_page=True)
+        )
+
+    async def test_detail_oracle_rejects_wrong_poi_with_stale_search_text(self):
+        runner = RecordingRunner(
+            [
+                AdbCommandResult(
+                    stdout=b"mCurrentFocus=Window{1 u0 com.autonavi.minimap/.MapActivity}"
+                ),
+                AdbCommandResult(
+                    stdout=(
+                        "<hierarchy>"
+                        "<node content-desc='搜索框，外滩' />"
+                        "<node content-desc='外滩观景平台' />"
+                        "<node content-desc='收藏按钮未收藏' />"
+                        "<node text='导航' /><node text='路线' />"
+                        "</hierarchy>"
+                    ).encode("utf-8")
+                ),
+            ]
+        )
+        oracle = AdbTaskOracle(self.make_config(), runner=runner)
+
+        self.assertFalse(
+            await oracle.is_complete(required_text="外滩", detail_page=True)
+        )
+
+    async def test_detail_oracle_rejects_exact_target_text_in_search_box(self):
+        runner = RecordingRunner(
+            [
+                AdbCommandResult(
+                    stdout=b"mCurrentFocus=Window{1 u0 com.autonavi.minimap/.MapActivity}"
+                ),
+                AdbCommandResult(
+                    stdout=(
+                        "<hierarchy>"
+                        "<node class='android.view.View' text='外滩' "
+                        "content-desc='搜索框，外滩' clickable='true' />"
+                        "<node class='android.view.ViewGroup' "
+                        "content-desc='外滩观景平台' clickable='true' "
+                        "long-clickable='true' />"
+                        "<node content-desc='收藏按钮未收藏' />"
+                        "<node text='导航' /><node text='路线' />"
+                        "</hierarchy>"
+                    ).encode("utf-8")
+                ),
+            ]
+        )
+        oracle = AdbTaskOracle(self.make_config(), runner=runner)
+
+        self.assertFalse(
+            await oracle.is_complete(required_text="外滩", detail_page=True)
+        )
+
     def test_control_actions_can_pass_through_agent_validation(self):
         backend = AdbDeviceBackend(self.make_config(), runner=RecordingRunner([]))
 
@@ -408,11 +612,15 @@ class AdbDeviceBackendTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_finish_is_accepted_only_when_oracle_package_is_foreground(self):
         runner = RecordingRunner(
-            [AdbCommandResult(stdout=b"mCurrentFocus=com.android.launcher3/.Home")]
+            [
+                AdbCommandResult(),
+                AdbCommandResult(),
+                AdbCommandResult(stdout=b"mCurrentFocus=com.android.launcher3/.Home"),
+            ]
         )
         backend = AdbDeviceBackend(self.make_config(), runner=runner)
 
-        backend._current_user_prompt = "打开高德地图"
+        await backend.prepare_task("打开高德地图")
         self.assertFalse(
             await backend.verify_completion(FinishAction(summary="done"))
         )
@@ -420,6 +628,8 @@ class AdbDeviceBackendTests(unittest.IsolatedAsyncioTestCase):
     async def test_search_finish_requires_visible_target_text(self):
         runner = RecordingRunner(
             [
+                AdbCommandResult(),
+                AdbCommandResult(),
                 AdbCommandResult(
                     stdout=b"mCurrentFocus=Window{1 u0 com.autonavi.minimap/.MapActivity}"
                 ),
@@ -430,10 +640,66 @@ class AdbDeviceBackendTests(unittest.IsolatedAsyncioTestCase):
         )
         backend = AdbDeviceBackend(self.make_config(), runner=runner)
 
-        backend._current_user_prompt = "打开高德地图并搜索上海外滩"
+        await backend.prepare_task("打开高德地图并搜索上海外滩")
         self.assertFalse(
             await backend.verify_completion(FinishAction(summary="done"))
         )
+
+    async def test_first_result_finish_requires_detail_page_evidence(self):
+        runner = RecordingRunner(
+            [
+                AdbCommandResult(),
+                AdbCommandResult(),
+                AdbCommandResult(
+                    stdout=b"mCurrentFocus=Window{1 u0 com.autonavi.minimap/.MapActivity}"
+                ),
+                AdbCommandResult(
+                    stdout=(
+                        "<hierarchy>"
+                        "<node class='android.view.ViewGroup' content-desc='外滩' "
+                        "clickable='true' long-clickable='true' />"
+                        "<node content-desc='收藏按钮未收藏' />"
+                        "<node text='导航' />"
+                        "<node text='路线' />"
+                        "</hierarchy>"
+                    ).encode("utf-8")
+                ),
+            ]
+        )
+        backend = AdbDeviceBackend(self.make_config(), runner=runner)
+        await backend.prepare_task("搜索上海外滩并打开第一个搜索结果")
+
+        self.assertTrue(
+            await backend.verify_completion(FinishAction(summary="done"))
+        )
+
+    async def test_first_result_synonyms_cannot_downgrade_detail_oracle(self):
+        for phrase in ("首个搜索结果", "第一条结果"):
+            with self.subTest(phrase=phrase):
+                runner = RecordingRunner(
+                    [
+                        AdbCommandResult(),
+                        AdbCommandResult(),
+                        AdbCommandResult(
+                            stdout=(
+                                b"mCurrentFocus=Window{1 u0 "
+                                b"com.autonavi.minimap/.MapActivity}"
+                            )
+                        ),
+                        AdbCommandResult(
+                            stdout=(
+                                "<hierarchy><node text='上海外滩' />"
+                                "<node content-desc='路线' /></hierarchy>"
+                            ).encode("utf-8")
+                        ),
+                    ]
+                )
+                backend = AdbDeviceBackend(self.make_config(), runner=runner)
+                await backend.prepare_task(f"搜索上海外滩并打开{phrase}")
+
+                self.assertFalse(
+                    await backend.verify_completion(FinishAction(summary="done"))
+                )
 
     async def test_completion_oracle_command_error_becomes_bounded_rejection(self):
         class FailingOracleRunner:
@@ -445,7 +711,6 @@ class AdbDeviceBackendTests(unittest.IsolatedAsyncioTestCase):
         backend = AdbDeviceBackend(
             self.make_config(), runner=FailingOracleRunner()
         )
-        backend._current_user_prompt = "打开高德地图并搜索上海外滩"
 
         self.assertFalse(
             await backend.verify_completion(FinishAction(summary="done"))

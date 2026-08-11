@@ -67,6 +67,11 @@ class KimiModelProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"type":"wait"', KimiModelProvider.prompt)
         self.assertNotIn('"type":"launch_app"', KimiModelProvider.prompt)
 
+    def test_prompt_allows_swipe_only_when_a_result_is_not_visible(self):
+        self.assertIn('"type":"swipe"', KimiModelProvider.prompt)
+        self.assertIn("result is not visible", KimiModelProvider.prompt)
+        self.assertIn("latest screenshot", KimiModelProvider.prompt)
+
     def test_thinking_mode_cannot_be_enabled(self):
         with self.assertRaises(ValidationError):
             KimiConfig(api_key=SecretStr("unit-test-key"), thinking_mode="enabled")
