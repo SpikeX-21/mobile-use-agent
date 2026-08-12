@@ -11,7 +11,9 @@
 
 import asyncio
 import logging
+import time
 from mobile_agent.agent.actions import FailAction, FinishAction
+from mobile_agent.agent.experiments.records import StepOutcome
 from mobile_agent.agent.llm.provider import ActionParseError
 from mobile_agent.exception.sse import SSEException
 from mobile_agent.agent.memory.context_manager import ContextManager
@@ -39,6 +41,21 @@ from mobile_agent.agent.mobile.result import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _record_experiment_step(
+    state: MobileUseAgentState,
+    outcome: StepOutcome,
+) -> None:
+    experiment_run = agent_object_manager.get_experiment_run(state.get("thread_id"))
+    if experiment_run is None:
+        return
+    experiment_run.try_record_outcome(
+        step_number=state.get("iteration_count", 0),
+        model_latency_ms=state.get("model_latency_ms", 0),
+        observation_images_used=state.get("observation_images_used", 0),
+        outcome=outcome,
+    )
 
 
 def _retry_would_exceed_step_limit(state: MobileUseAgentState) -> bool:
@@ -109,13 +126,19 @@ async def model_node(state: MobileUseAgentState) -> MobileUseAgentState:
     model_provider = agent_object_manager.get_model_provider(state.get("thread_id"))
     context_manager = agent_object_manager.get_context_manager(state.get("thread_id"))
     iteration_count = state.get("iteration_count")
+    state.update(model_latency_ms=0, observation_images_used=0)
 
     # 获取截图
     try:
         screenshot_state = await device_backend.take_screenshot()
     except DeviceBackendError as exc:
         label = "设备离线" if exc.kind is DeviceErrorKind.OFFLINE else "设备观察失败"
-        state.update(terminal_reason=f"{label}：{exc}")
+        state.update(
+            terminal_reason=f"{label}：{exc}",
+            experiment_terminal_reason="device_observation_failed",
+            experiment_error_kind=exc.kind.value,
+            experiment_action_type="observation",
+        )
         return state
     state.update(screenshot=screenshot_state.get("screenshot"))
     state.update(screenshot_dimensions=screenshot_state.get("screenshot_dimensions"))
@@ -136,6 +159,11 @@ async def model_node(state: MobileUseAgentState) -> MobileUseAgentState:
 
     # 保留最后5张图片
     context_manager.keep_last_n_images_in_messages(5)
+    observation_images_used = context_manager.count_images_in_messages()
+    state.update(observation_images_used=observation_images_used)
+    experiment_run = agent_object_manager.get_experiment_run(state.get("thread_id"))
+    if experiment_run is not None:
+        experiment_run.note_observation_images_used(observation_images_used)
     state.update(messages=context_manager.get_messages())
 
     # 更新步数
@@ -143,11 +171,31 @@ async def model_node(state: MobileUseAgentState) -> MobileUseAgentState:
     cost_calculator.update_step(iteration_count)
 
     # 调用模型
-    chunk_id, content, summary, tool_call = await model_provider.async_chat(
-        context_manager.get_messages()
-    )
+    model_started = time.perf_counter()
+    try:
+        chunk_id, content, summary, tool_call = await model_provider.async_chat(
+            context_manager.get_messages()
+        )
+    except asyncio.CancelledError:
+        if experiment_run is not None:
+            experiment_run.try_record_terminal_once("cancelled")
+        raise
+    except Exception:
+        state.update(
+            terminal_reason="模型调用失败，请稍后重试",
+            experiment_terminal_reason="model_call_failed",
+            experiment_error_kind=None,
+            experiment_action_type="model_call",
+        )
+        return state
+    finally:
+        state.update(
+            model_latency_ms=max(
+                0, round((time.perf_counter() - model_started) * 1000)
+            )
+        )
 
-    logger.info(f"content========: {content}")
+    logger.info("Model response received: chunk_id=%s", chunk_id)
 
     if not state.get("is_stream") or not model_provider.supports_streaming:
         # 请求或模型适配器不支持流式时，直接输出对应 summary。
@@ -173,6 +221,17 @@ async def tool_valid_node(state: MobileUseAgentState) -> MobileUseAgentState:
     model_provider = agent_object_manager.get_model_provider(state.get("thread_id"))
     device_backend = agent_object_manager.get_device_backend(state.get("thread_id"))
     if state.get("terminal_reason"):
+        _record_experiment_step(
+            state,
+            StepOutcome(
+                action_type=state.get("experiment_action_type") or "runtime",
+                action_status="failed",
+                device_error_kind=state.get("experiment_error_kind"),
+                terminal_reason=(
+                    state.get("experiment_terminal_reason") or "runtime_failed"
+                ),
+            ),
+        )
         _set_terminal_failure(state, state.get("terminal_reason"), device_backend)
         return state
     try:
@@ -181,12 +240,28 @@ async def tool_valid_node(state: MobileUseAgentState) -> MobileUseAgentState:
         schema_error_count = state.get("schema_error_count", 0) + 1
         if schema_error_count >= 3:
             state.update(schema_error_count=schema_error_count)
+            _record_experiment_step(
+                state,
+                StepOutcome(
+                    action_type="invalid_action",
+                    schema_status="invalid",
+                    terminal_reason="schema_error_limit",
+                ),
+            )
             _set_terminal_failure(
                 state, "模型动作连续 3 次未通过 Schema 校验", device_backend
             )
             return state
         if _retry_would_exceed_step_limit(state):
             state.update(schema_error_count=schema_error_count)
+            _record_experiment_step(
+                state,
+                StepOutcome(
+                    action_type="invalid_action",
+                    schema_status="invalid",
+                    terminal_reason="step_limit",
+                ),
+            )
             _set_terminal_failure(
                 state, "任务达到 10 步上限，已安全终止", device_backend
             )
@@ -198,6 +273,10 @@ async def tool_valid_node(state: MobileUseAgentState) -> MobileUseAgentState:
             tool_output={
                 "result": "模型输出解析失败，请尝试重新按照正确的格式生成"
             },
+        )
+        _record_experiment_step(
+            state,
+            StepOutcome(action_type="invalid_action", schema_status="invalid"),
         )
         sse_writer = get_stream_writer()
         sse_writer(
@@ -215,15 +294,49 @@ async def tool_valid_node(state: MobileUseAgentState) -> MobileUseAgentState:
 
     state.update(schema_error_count=0)
     verify_completion = getattr(device_backend, "verify_completion", None)
+    oracle_result = None
+    oracle_latency_ms = None
     if isinstance(action, FinishAction) and callable(verify_completion):
-        if await verify_completion(action) is False:
+        oracle_started = time.perf_counter()
+        oracle_result = await verify_completion(action)
+        oracle_latency_ms = max(
+            0, round((time.perf_counter() - oracle_started) * 1000)
+        )
+        if oracle_result is False:
             oracle_failure_count = state.get("oracle_failure_count", 0) + 1
             if oracle_failure_count >= 2:
-                action = FailAction(reason="ADB 独立 Oracle 连续两次未满足完成条件")
+                _record_experiment_step(
+                    state,
+                    StepOutcome(
+                        action=action,
+                        device_latency_ms=oracle_latency_ms,
+                        action_status="rejected",
+                        schema_status="valid",
+                        terminal_reason="oracle_rejected",
+                        oracle_result=False,
+                    ),
+                )
                 state.update(oracle_failure_count=oracle_failure_count)
+                _set_terminal_failure(
+                    state,
+                    "ADB 独立 Oracle 连续两次未满足完成条件",
+                    device_backend,
+                )
+                return state
             else:
                 if _retry_would_exceed_step_limit(state):
                     state.update(oracle_failure_count=oracle_failure_count)
+                    _record_experiment_step(
+                        state,
+                        StepOutcome(
+                            action=action,
+                            device_latency_ms=oracle_latency_ms,
+                            action_status="rejected",
+                            schema_status="valid",
+                            terminal_reason="step_limit",
+                            oracle_result=False,
+                        ),
+                    )
                     _set_terminal_failure(
                         state, "任务达到 10 步上限，已安全终止", device_backend
                     )
@@ -239,6 +352,16 @@ async def tool_valid_node(state: MobileUseAgentState) -> MobileUseAgentState:
                         "result": "ADB 独立 Oracle 校验未通过，请根据最新截图继续操作"
                     },
                 )
+                _record_experiment_step(
+                    state,
+                    StepOutcome(
+                        action=action,
+                        device_latency_ms=oracle_latency_ms,
+                        action_status="rejected",
+                        schema_status="valid",
+                        oracle_result=False,
+                    ),
+                )
                 return state
         else:
             state.update(oracle_failure_count=0)
@@ -249,6 +372,15 @@ async def tool_valid_node(state: MobileUseAgentState) -> MobileUseAgentState:
         )
     except (NotImplementedError, TypeError, ValueError) as exc:
         if _retry_would_exceed_step_limit(state):
+            _record_experiment_step(
+                state,
+                StepOutcome(
+                    action=action,
+                    action_status="unsupported",
+                    schema_status="valid",
+                    terminal_reason="step_limit",
+                ),
+            )
             _set_terminal_failure(
                 state, "任务达到 10 步上限，已安全终止", device_backend
             )
@@ -263,10 +395,29 @@ async def tool_valid_node(state: MobileUseAgentState) -> MobileUseAgentState:
                 "result": "当前设备后端不支持该动作，请仅使用已声明的动作重新生成"
             },
         )
+        _record_experiment_step(
+            state,
+            StepOutcome(
+                action=action,
+                action_status="unsupported",
+                schema_status="valid",
+            ),
+        )
         return state
     state.update(action=action, tool_call=tool_call)
 
     if isinstance(action, FinishAction):
+        _record_experiment_step(
+            state,
+            StepOutcome(
+                action=action,
+                device_latency_ms=oracle_latency_ms,
+                action_status="success",
+                schema_status="valid",
+                terminal_reason="completed",
+                oracle_result=oracle_result,
+            ),
+        )
         sse_writer = get_stream_writer()
         sse_writer(
             format_sse(
@@ -281,6 +432,15 @@ async def tool_valid_node(state: MobileUseAgentState) -> MobileUseAgentState:
         )
         state.update(tool_output="上一轮任务已经完成，更多的根据用户新的输入完成任务")
     elif isinstance(action, FailAction):
+        _record_experiment_step(
+            state,
+            StepOutcome(
+                action=action,
+                action_status="failed",
+                schema_status="valid",
+                terminal_reason="model_failed",
+            ),
+        )
         sse_writer = get_stream_writer()
         sse_writer(
             format_sse(
@@ -312,9 +472,10 @@ async def tool_node(state: MobileUseAgentState) -> MobileUseAgentState:
     # 写工具 input
     sse_writer(get_writer_tool_input(state, tool_call))
 
-    logger.info(f"tool_call========: {tool_call}")
+    logger.info("Tool call dispatched: name=%s", tool_call.get("name"))
     action_result: ActionResult
     device_backend = agent_object_manager.get_device_backend(state.get("thread_id"))
+    device_started = time.perf_counter()
     try:
         raw_result = await device_backend.execute(
             action, state.get("screenshot_dimensions")
@@ -324,14 +485,26 @@ async def tool_node(state: MobileUseAgentState) -> MobileUseAgentState:
             if isinstance(raw_result, ActionResult)
             else ActionResult.success(str(raw_result))
         )
+    except asyncio.CancelledError:
+        experiment_run = agent_object_manager.get_experiment_run(
+            state.get("thread_id")
+        )
+        if experiment_run is not None:
+            experiment_run.try_record_terminal_once("cancelled")
+        raise
     except TimeoutError:
         action_result = ActionResult.ambiguous(
             "设备动作超时，结果不确定", DeviceErrorKind.TIMEOUT
         )
     except Exception as exc:
-        logger.error(f"tool_call_client.call error: {exc}")
+        logger.error(
+            "Device action failed: error_type=%s", type(exc).__name__
+        )
         error_kind = classify_device_error(exc)
         action_result = ActionResult.failed(str(exc), error_kind)
+    device_latency_ms = max(
+        0, round((time.perf_counter() - device_started) * 1000)
+    )
 
     output = {
         "status": action_result.status.value,
@@ -349,15 +522,38 @@ async def tool_node(state: MobileUseAgentState) -> MobileUseAgentState:
         sse_writer(get_writer_tool_output(state, tool_call, output, status="stop"))
 
     if action_result.error_kind is DeviceErrorKind.OFFLINE:
+        terminal_reason = "device_offline"
         _set_terminal_failure(
             state, f"设备离线：{action_result.message}", device_backend
         )
     elif state.get("iteration_count", 0) >= state.get("max_iterations", 10):
+        terminal_reason = "step_limit"
         _set_terminal_failure(
             state, "任务达到 10 步上限，已安全终止", device_backend
         )
 
-    logger.info(f"tool_output========: {state.get('tool_output')}")
+    else:
+        terminal_reason = None
+
+    _record_experiment_step(
+        state,
+        StepOutcome(
+            action=action,
+            device_latency_ms=device_latency_ms,
+            action_status=action_result.status.value,
+            device_error_kind=(
+                action_result.error_kind.value if action_result.error_kind else None
+            ),
+            schema_status="valid",
+            terminal_reason=terminal_reason,
+        ),
+    )
+
+    logger.info(
+        "Tool result received: status=%s, error_kind=%s",
+        output["status"],
+        output["error_kind"],
+    )
 
     return state
 

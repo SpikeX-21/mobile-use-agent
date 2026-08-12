@@ -29,7 +29,7 @@ class ErrorTool(SpecialTool):
         args: dict,
     ):
         content = args.get("content")
-        logger.error(f"模型输出解析失败，正在尝试重新生成: {content}")
+        logger.error("模型输出解析失败，正在尝试重新生成")
         return "模型输出解析失败，正在尝试重新生成"
 
     def special_message(self, content: str, args: dict):

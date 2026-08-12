@@ -96,6 +96,7 @@ ADB_SERIAL=<设备地址或序列号>
 ADB_VENDOR_KEYS=<ADB 私钥路径，可在 adb server 已加载密钥时留空>
 ADB_COMMAND_TIMEOUT=10
 ADB_ORACLE_PACKAGE=com.autonavi.minimap
+EXPERIMENT_RECORD_PATH=logs/experiment-runs.jsonl
 ```
 
 也兼容用 `OPENAI_BASE_URL` 提供接口地址；若同时设置，`KIMI_BASE_URL` 优先。
@@ -130,6 +131,15 @@ ADB Backend 支持 `tap`、`swipe`、`text_input`、`clear_text`、`home`、`bac
 尝试两次；设备离线、连续三次动作 Schema 错误或达到十步上限时会给出明确原因并
 终止。每个工具调用只会产生一个最终 SSE 状态，不会在 `stop` 后再次发送
 `success`。
+
+每次 Agent 运行还会向 `EXPERIMENT_RECORD_PATH` 追加脱敏 JSONL。每行代表一个
+模型决策步骤，包含运行/场景 ID、Provider、模型、步骤和动作、模型/设备耗时、
+动作与 Schema 状态、失败类型、终止原因及 Oracle 结果。场景 ID 由规范化任务文本
+生成稳定哈希，原始任务文本不会保存；`text_input` 参数只保存字符长度与 SHA-256。
+API Key、AK/SK、Authorization、ADB 私钥、截图 Base64、签名 URL 和隐藏思维均会
+在写入前移除。当前截图实验策略记录为 `fixed_recent`、窗口大小 `5`，只保存策略和
+实际使用数量，不保存截图；相同字段也可用于未来 `dynamic_recent` 一至两张策略的
+A/B Test，本期不启用动态策略。默认输出位于已被 Git 忽略的 `logs/` 目录。
 
 ## 🛠️ 核心组件
 

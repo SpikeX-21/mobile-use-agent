@@ -31,6 +31,7 @@ class ActionParseError(ValueError):
 
 class ModelProvider(Protocol):
     name: str
+    model: str
     prompt: str
     supports_streaming: bool
 
@@ -54,6 +55,7 @@ class DoubaoModelProvider:
         action_parser: DoubaoActionSpaceParser | None = None,
     ):
         self._llm = llm or DoubaoLLM(thread_id=thread_id, is_stream=is_stream)
+        self.model = str(getattr(self._llm, "model_name", "unknown"))
         self._action_parser = action_parser or DoubaoActionSpaceParser()
 
     async def async_chat(

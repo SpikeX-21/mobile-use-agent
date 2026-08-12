@@ -103,6 +103,17 @@ class ContextManager:
 
         self._messages.replace_all(messages)
 
+    def count_images_in_messages(self) -> int:
+        """Count screenshot parts in the exact message payload sent to the model."""
+
+        return sum(
+            1
+            for message in self._messages.get_messages()
+            if isinstance(message.content, list)
+            for part in message.content
+            if isinstance(part, dict) and part.get("type") == "image_url"
+        )
+
 
     @staticmethod
     def get_snapshot_user_prompt(url: str, user_content: str) -> HumanMessage:

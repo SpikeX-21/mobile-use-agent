@@ -143,6 +143,11 @@ class Settings(BaseSettings):
             "ADB_ORACLE_PACKAGE", "com.autonavi.minimap"
         )
     )
+    experiment_record_path: str = Field(
+        default_factory=lambda: os.environ.get(
+            "EXPERIMENT_RECORD_PATH", "logs/experiment-runs.jsonl"
+        )
+    )
     config_path: Optional[str] = Field(default=None, description="配置文件路径")
 
     llms: Dict[str, LLMConfig] = Field(default_factory=dict, description="LLM配置")

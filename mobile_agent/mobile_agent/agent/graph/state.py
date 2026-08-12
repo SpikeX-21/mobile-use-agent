@@ -26,6 +26,11 @@ class SharedState(AgentState):
     oracle_failure_count: int  # 连续完成条件校验失败次数
     schema_error_count: int  # 连续模型动作 Schema 错误次数
     terminal_reason: Optional[str]  # 无需再调用模型的明确终止原因
+    experiment_terminal_reason: Optional[str]  # 脱敏的稳定终止分类
+    experiment_error_kind: Optional[str]  # 脱敏的设备失败分类
+    experiment_action_type: Optional[str]  # 未产生 CanonicalAction 时的阶段
+    model_latency_ms: int  # 当前模型决策耗时，不包含设备观察
+    observation_images_used: int  # 当前模型调用实际携带的截图数量
 
 
 class ToolCallState(SharedState):

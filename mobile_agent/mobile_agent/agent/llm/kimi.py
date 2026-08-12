@@ -38,6 +38,7 @@ class KimiModelProvider:
     ):
         self.thread_id = thread_id
         self.config = config
+        self.model = config.model
         self._client = client or AsyncOpenAI(
             api_key=config.api_key.get_secret_value(),
             base_url=config.base_url,
