@@ -73,6 +73,26 @@ class AdbCompletionExpectation:
         )
 
 
+@dataclass(frozen=True)
+class AdbOracleEvidence:
+    """Allowlisted facts observed by the independent ADB completion oracle."""
+
+    foreground_package_match: bool
+    query_text_visible: bool | None = None
+    detail_title_visible: bool | None = None
+    favorite_control_visible: bool | None = None
+
+    @property
+    def complete(self) -> bool:
+        checks = (
+            self.foreground_package_match,
+            self.query_text_visible,
+            self.detail_title_visible,
+            self.favorite_control_visible,
+        )
+        return all(value is not False for value in checks)
+
+
 class AdbRunner(Protocol):
     async def run(self, *arguments: str) -> AdbCommandResult: ...
 
@@ -154,6 +174,7 @@ class AdbDeviceBackend:
         self.config = config
         self._runner = runner or SubprocessAdbRunner(config)
         self._completion_expectation = AdbCompletionExpectation()
+        self.last_completion_evidence: AdbOracleEvidence | None = None
 
     async def initialize(self, **connection: str) -> None:
         result = await self._runner.run("-s", self.config.serial, "get-state")
@@ -167,6 +188,7 @@ class AdbDeviceBackend:
         self._completion_expectation = AdbCompletionExpectation.from_user_prompt(
             user_prompt
         )
+        self.last_completion_evidence = None
         await self._runner.run(
             "-s",
             self.config.serial,
@@ -500,11 +522,13 @@ class AdbDeviceBackend:
             return None
         oracle = AdbTaskOracle(self.config, runner=self._runner)
         try:
-            return await oracle.is_complete(
+            self.last_completion_evidence = await oracle.observe(
                 required_text=self._completion_expectation.required_text,
                 detail_page=self._completion_expectation.detail_page,
             )
+            return self.last_completion_evidence.complete
         except AdbCommandError:
+            self.last_completion_evidence = None
             return False
 
 
@@ -547,13 +571,25 @@ class AdbTaskOracle:
         *,
         detail_page: bool = False,
     ) -> bool:
+        evidence = await self.observe(
+            required_text=required_text,
+            detail_page=detail_page,
+        )
+        return evidence.complete
+
+    async def observe(
+        self,
+        required_text: str | None = None,
+        *,
+        detail_page: bool = False,
+    ) -> AdbOracleEvidence:
         foreground_oracle = AdbForegroundAppOracle(
             self._config, runner=self._runner
         )
         if not await foreground_oracle.is_foreground():
-            return False
+            return AdbOracleEvidence(foreground_package_match=False)
         if required_text is None and not detail_page:
-            return True
+            return AdbOracleEvidence(foreground_package_match=True)
 
         result = await self._runner.run(
             "-s",
@@ -567,12 +603,22 @@ class AdbTaskOracle:
         output = result.stdout.decode("utf-8", errors="replace")
         hierarchy_end = output.find("</hierarchy>")
         if hierarchy_end < 0:
-            return False
+            return AdbOracleEvidence(
+                foreground_package_match=True,
+                query_text_visible=False if not detail_page else None,
+                detail_title_visible=False if detail_page else None,
+                favorite_control_visible=False if detail_page else None,
+            )
         xml_document = output[: hierarchy_end + len("</hierarchy>")]
         try:
             hierarchy = ET.fromstring(xml_document)
         except ET.ParseError:
-            return False
+            return AdbOracleEvidence(
+                foreground_package_match=True,
+                query_text_visible=False if not detail_page else None,
+                detail_title_visible=False if detail_page else None,
+                favorite_control_visible=False if detail_page else None,
+            )
         visible_nodes = [
             node
             for node in hierarchy.iter()
@@ -584,6 +630,7 @@ class AdbTaskOracle:
             for attribute in ("text", "content-desc")
             if node.attrib.get(attribute, "")
         ]
+        target_is_visible = None
         if required_text is not None:
             target_is_visible = (
                 any(
@@ -596,11 +643,18 @@ class AdbTaskOracle:
                 if detail_page
                 else any(required_text in value for value in visible_values)
             )
-            if not target_is_visible:
-                return False
         if not detail_page:
-            return True
+            return AdbOracleEvidence(
+                foreground_package_match=True,
+                query_text_visible=target_is_visible,
+            )
         # Compressed hierarchies omit non-focusable child labels such as the
         # visible "导航" and "路线" text.  The exact semantic title node plus
         # the detail-only favourite control remains stable device evidence.
-        return any(value.startswith("收藏按钮") for value in visible_values)
+        return AdbOracleEvidence(
+            foreground_package_match=True,
+            detail_title_visible=target_is_visible,
+            favorite_control_visible=any(
+                value.startswith("收藏按钮") for value in visible_values
+            ),
+        )

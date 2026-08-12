@@ -141,6 +141,21 @@ API Key、AK/SK、Authorization、ADB 私钥、截图 Base64、签名 URL 和隐
 实际使用数量，不保存截图；相同字段也可用于未来 `dynamic_recent` 一至两张策略的
 A/B Test，本期不启用动态策略。默认输出位于已被 Git 忽略的 `logs/` 目录。
 
+### 九轮实机验收与 Demo 交付
+
+完整的 Conda 环境、配置占位符、ADB 检查、服务启动顺序和九轮验收说明见
+[Kimi K2.6 + ADB Demo 本地启动与验收](../docs/demo-delivery.md)。在
+`mobile_agent` 目录执行以下命令，会无人干预地运行三个场景各三次，并生成脱敏的
+Markdown/JSON 报告：
+
+```bash
+python -m mobile_agent.acceptance \
+  --attest-no-manual-intervention \
+  --output-dir logs/acceptance-run
+```
+
+Kimi + ADB 路径不启动也不调用 Go MCP；Doubao + 火山 MCP 兼容回归单独标识。
+
 ## 🛠️ 核心组件
 
 通过 Mobile Use MCP 支持的移动设备操作：

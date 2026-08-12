@@ -1016,6 +1016,14 @@ class AdbDeviceBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             await backend.verify_completion(FinishAction(summary="done"))
         )
+        self.assertIsNotNone(backend.last_completion_evidence)
+        self.assertTrue(
+            backend.last_completion_evidence.foreground_package_match
+        )
+        self.assertTrue(backend.last_completion_evidence.detail_title_visible)
+        self.assertTrue(
+            backend.last_completion_evidence.favorite_control_visible
+        )
 
     async def test_first_result_synonyms_cannot_downgrade_detail_oracle(self):
         for phrase in ("首个搜索结果", "第一条结果"):

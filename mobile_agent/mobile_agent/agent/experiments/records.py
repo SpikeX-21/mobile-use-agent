@@ -85,17 +85,37 @@ def _is_signed_url(value: str) -> bool:
     return bool(query_keys & _SIGNED_QUERY_KEYS)
 
 
+def contains_sensitive_text(value: str) -> bool:
+    """Return whether free text contains a credential or private observation."""
+
+    lowered = value.lower()
+    if any(
+        marker in lowered
+        for marker in (
+            "data:image/",
+            "hidden_thinking",
+            "hidden_reasoning",
+            "chain_of_thought",
+        )
+    ):
+        return True
+    if re.search(r"(?im)^\s*(?:proxy-)?authorization\s*[:=]", value):
+        return True
+    if any(pattern.search(value) for pattern in _SECRET_VALUE_PATTERNS):
+        return True
+    return any(
+        _is_signed_url(candidate)
+        for candidate in re.findall(r"https?://[^\s\"'<>]+", value)
+    )
+
+
 def _redact_value(value: Any) -> Any:
     if isinstance(value, Mapping):
         return redact_mapping(value)
     if isinstance(value, (list, tuple)):
         return [_redact_value(item) for item in value]
     if isinstance(value, str):
-        if (
-            value.lower().startswith("data:image/")
-            or _is_signed_url(value)
-            or any(pattern.search(value) for pattern in _SECRET_VALUE_PATTERNS)
-        ):
+        if contains_sensitive_text(value):
             return _REDACTED
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
