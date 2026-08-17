@@ -13,7 +13,19 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 from PIL import Image
 
-from mobile_agent.agent.actions import HomeAction, TapAction
+from mobile_agent.agent.actions import (
+    ClearTextAction,
+    CloseAppAction,
+    FailAction,
+    FinishAction,
+    LaunchAppAction,
+    ListAppsAction,
+    SwipeAction,
+    TextInputAction,
+    HomeAction,
+    TapAction,
+    WaitAction,
+)
 from mobile_agent.agent.mobile.koophone import (
     KOOPHONE_REQUIRED_TOOLS,
     KooPhoneDeviceBackend,
@@ -105,7 +117,10 @@ class ToolCallingMcpTransport(RecordingMcpTransport):
 
     async def call_tool(self, name, arguments):
         self.tool_calls.append((name, arguments))
-        return self.tool_results.pop(0)
+        result = self.tool_results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
 
 
 class KooPhoneStartupTests(unittest.IsolatedAsyncioTestCase):
@@ -384,6 +399,123 @@ class KooPhoneStartupTests(unittest.IsolatedAsyncioTestCase):
             transport.tool_calls,
             [("tap", {"instanceId": "instance-test-1", "x": 1, "y": 2})],
         )
+
+    async def test_maps_all_koophone_device_actions_to_the_allowlisted_contract(self):
+        backend = KooPhoneDeviceBackend(
+            koophone_config(), authenticator=StaticAuthenticator(), transport=RecordingMcpTransport()
+        )
+
+        calls = [
+            (TapAction(x=500, y=500), (100, 200), {"name": "tap", "arguments": {"x": 50, "y": 100}}),
+            (SwipeAction(start_x=0, start_y=1000, end_x=500, end_y=0, duration_ms=450), (100, 200), {"name": "swipe", "arguments": {"startX": 0, "startY": 199, "endX": 50, "endY": 0, "durationMs": 450}}),
+            (TextInputAction(text="hello"), (100, 200), {"name": "input_text", "arguments": {"text": "hello"}}),
+            (ClearTextAction(), (100, 200), {"name": "clear_text", "arguments": {}}),
+            (LaunchAppAction(package_name="com.example.app"), (100, 200), {"name": "start_app", "arguments": {"packageName": "com.example.app"}}),
+            (CloseAppAction(package_name="com.example.app"), (100, 200), {"name": "stop_app", "arguments": {"packageName": "com.example.app"}}),
+            (ListAppsAction(ignore_system_apps=True), (100, 200), {"name": "get_installed_apps", "arguments": {"ignoreSystemApp": True}}),
+            (WaitAction(duration_ms=10), (100, 200), {"name": "wait", "arguments": {"t": 0.01}}),
+        ]
+
+        for action, dimensions, expected in calls:
+            self.assertEqual(backend.to_tool_call(action, dimensions), expected)
+
+    async def test_all_device_actions_are_dispatched_with_the_fixed_instance_id(self):
+        transport = ToolCallingMcpTransport(["ok"] * 7)
+        backend = KooPhoneDeviceBackend(
+            koophone_config(), authenticator=StaticAuthenticator(), transport=transport
+        )
+        await backend.initialize()
+
+        actions = [
+            TapAction(x=500, y=500),
+            SwipeAction(start_x=0, start_y=1000, end_x=500, end_y=0),
+            TextInputAction(text="hello"),
+            ClearTextAction(),
+            LaunchAppAction(package_name="com.example.app"),
+            CloseAppAction(package_name="com.example.app"),
+            ListAppsAction(ignore_system_apps=False),
+        ]
+        for action in actions:
+            self.assertTrue((await backend.execute(action, (100, 200))).status.value == "success")
+
+        self.assertEqual(
+            transport.tool_calls,
+            [
+                ("tap", {"x": 50, "y": 100, "instanceId": "instance-test-1"}),
+                ("swipe", {"startX": 0, "startY": 199, "endX": 50, "endY": 0, "durationMs": 300, "instanceId": "instance-test-1"}),
+                ("input_text", {"text": "hello", "instanceId": "instance-test-1"}),
+                ("clear_text", {"instanceId": "instance-test-1"}),
+                ("start_app", {"packageName": "com.example.app", "instanceId": "instance-test-1"}),
+                ("stop_app", {"packageName": "com.example.app", "instanceId": "instance-test-1"}),
+                ("get_installed_apps", {"ignoreSystemApp": False, "instanceId": "instance-test-1"}),
+            ],
+        )
+
+    async def test_rejects_any_non_allowlisted_koophone_tool(self):
+        transport = ToolCallingMcpTransport(["unexpected success"])
+        backend = KooPhoneDeviceBackend(
+            koophone_config(), authenticator=StaticAuthenticator(), transport=transport
+        )
+        await backend.initialize()
+
+        with self.assertRaisesRegex(ProviderConfigurationError, "not allowlisted"):
+            await backend._call_tool("adb_shell", {}, retry_safe=False)
+
+        self.assertEqual(transport.tool_calls, [])
+
+    async def test_side_effect_timeouts_and_explicit_mcp_failures_have_safe_receipts(self):
+        for timeout in (TimeoutError("upstream timeout"), httpx.ReadTimeout("")):
+            with self.subTest(timeout=type(timeout).__name__):
+                timeout_transport = ToolCallingMcpTransport([timeout])
+                timeout_backend = KooPhoneDeviceBackend(
+                    koophone_config(), authenticator=StaticAuthenticator(), transport=timeout_transport
+                )
+                await timeout_backend.initialize()
+
+                timeout_result = await timeout_backend.execute(TapAction(x=1, y=2), (100, 100))
+                self.assertEqual(timeout_result.status.value, "ambiguous")
+                self.assertEqual(timeout_result.error_kind.value, "timeout")
+
+        failure_transport = ToolCallingMcpTransport([SimpleNamespace(isError=True)])
+        failure_backend = KooPhoneDeviceBackend(
+            koophone_config(), authenticator=StaticAuthenticator(), transport=failure_transport
+        )
+        await failure_backend.initialize()
+
+        failure_result = await failure_backend.execute(TapAction(x=1, y=2), (100, 100))
+        self.assertEqual(failure_result.status.value, "failed")
+        self.assertEqual(failure_result.error_kind.value, "command_failed")
+
+    async def test_wait_finish_and_fail_remain_local_without_mcp_dispatch(self):
+        transport = ToolCallingMcpTransport([])
+        backend = KooPhoneDeviceBackend(
+            koophone_config(), authenticator=StaticAuthenticator(), transport=transport
+        )
+        await backend.initialize()
+
+        wait_result = await backend.execute(WaitAction(duration_ms=1), (100, 100))
+        finish_result = await backend.execute(FinishAction(summary="done"), (100, 100))
+        fail_result = await backend.execute(FailAction(reason="need help"), (100, 100))
+
+        self.assertEqual(
+            [wait_result.status.value, finish_result.status.value, fail_result.status.value],
+            ["success", "success", "success"],
+        )
+        self.assertEqual(transport.tool_calls, [])
+
+    async def test_list_apps_normalizes_mcp_text_for_the_agent(self):
+        transport = ToolCallingMcpTransport(
+            [SimpleNamespace(content=[SimpleNamespace(text='["com.example.app"]')])]
+        )
+        backend = KooPhoneDeviceBackend(
+            koophone_config(), authenticator=StaticAuthenticator(), transport=transport
+        )
+        await backend.initialize()
+
+        result = await backend.execute(ListAppsAction(ignore_system_apps=True), (100, 100))
+
+        self.assertEqual(result.status.value, "success")
+        self.assertEqual(result.message, 'KooPhone list_apps result: ["com.example.app"]')
 
 
 if __name__ == "__main__":

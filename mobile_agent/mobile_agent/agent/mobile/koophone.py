@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import AsyncExitStack
 import inspect
 import logging
@@ -15,11 +16,17 @@ from mcp.client.streamable_http import streamablehttp_client
 from mobile_agent.agent.actions import (
     BackAction,
     CanonicalAction,
+    ClearTextAction,
+    CloseAppAction,
     FailAction,
     FinishAction,
     HomeAction,
+    LaunchAppAction,
+    ListAppsAction,
     MenuAction,
+    SwipeAction,
     TapAction,
+    TextInputAction,
     WaitAction,
 )
 from mobile_agent.agent.infra.model import ToolCall
@@ -295,24 +302,47 @@ class KooPhoneDeviceBackend:
             return ActionResult.success(
                 f"Waited {action.duration_ms / 1000:g}s for the UI to settle"
             )
-        if not isinstance(action, (TapAction, HomeAction, BackAction, MenuAction)):
+        if isinstance(action, (FinishAction, FailAction)):
+            return ActionResult.success(f"KooPhone {action.type} handled locally")
+        if not isinstance(
+            action,
+            (
+                TapAction,
+                SwipeAction,
+                TextInputAction,
+                ClearTextAction,
+                HomeAction,
+                BackAction,
+                MenuAction,
+                LaunchAppAction,
+                CloseAppAction,
+                ListAppsAction,
+            ),
+        ):
             raise ProviderNotImplementedError(
                 "KooPhone action execution is delivered by Issue #15"
             )
         tool_call = self.to_tool_call(action, screenshot_dimensions)
         try:
-            await self._call_tool(
+            response = await self._call_tool(
                 tool_call["name"], tool_call["arguments"] or {}, retry_safe=False
             )
+            _ensure_koophone_tool_success(response)
         except KooPhoneOperationOutcomeUncertain:
             return ActionResult.ambiguous(
                 f"KooPhone {action.type} outcome is uncertain after authentication rejection",
                 DeviceErrorKind.COMMAND_FAILED,
             )
         except Exception as error:
-            return ActionResult.failed(
-                f"KooPhone {action.type} failed", classify_device_error(error)
-            )
+            error_kind = classify_device_error(error)
+            if error_kind is DeviceErrorKind.TIMEOUT:
+                return ActionResult.ambiguous(
+                    f"KooPhone {action.type} result is unknown after timeout",
+                    error_kind,
+                )
+            return ActionResult.failed(f"KooPhone {action.type} failed", error_kind)
+        if isinstance(action, ListAppsAction):
+            return ActionResult.success(_list_apps_result_message(response))
         return ActionResult.success(f"KooPhone {action.type} dispatched")
 
     def to_tool_call(
@@ -329,9 +359,42 @@ class KooPhoneDeviceBackend:
                     "y": _to_pixel(action.y, height),
                 },
             }
+        if isinstance(action, SwipeAction):
+            width, height = screenshot_dimensions
+            return {
+                "name": "swipe",
+                "arguments": {
+                    "startX": _to_pixel(action.start_x, width),
+                    "startY": _to_pixel(action.start_y, height),
+                    "endX": _to_pixel(action.end_x, width),
+                    "endY": _to_pixel(action.end_y, height),
+                    "durationMs": action.duration_ms,
+                },
+            }
+        if isinstance(action, TextInputAction):
+            return {"name": "input_text", "arguments": {"text": action.text}}
+        if isinstance(action, ClearTextAction):
+            return {"name": "clear_text", "arguments": {}}
         if isinstance(action, (HomeAction, BackAction, MenuAction)):
             key = {"home": "HOME", "back": "BACK", "menu": "MENU"}[action.type]
             return {"name": "send_key", "arguments": {"key": key}}
+        if isinstance(action, LaunchAppAction):
+            return {
+                "name": "start_app",
+                "arguments": {"packageName": action.package_name},
+            }
+        if isinstance(action, CloseAppAction):
+            return {
+                "name": "stop_app",
+                "arguments": {"packageName": action.package_name},
+            }
+        if isinstance(action, ListAppsAction):
+            arguments = (
+                {}
+                if action.ignore_system_apps is None
+                else {"ignoreSystemApp": action.ignore_system_apps}
+            )
+            return {"name": "get_installed_apps", "arguments": arguments}
         if isinstance(action, WaitAction):
             return {"name": "wait", "arguments": {"t": action.duration_ms / 1000}}
         if isinstance(action, FinishAction):
@@ -345,6 +408,10 @@ class KooPhoneDeviceBackend:
     async def _call_tool(
         self, name: str, arguments: dict[str, Any], *, retry_safe: bool
     ) -> Any:
+        if name not in KOOPHONE_REQUIRED_TOOLS:
+            raise ProviderConfigurationError(
+                f"KooPhone tool is not allowlisted: {name}"
+            )
         server_arguments = {**arguments, "instanceId": self._config.instance_id}
         return await self.run_authenticated_operation(
             lambda: self._transport.call_tool(name, server_arguments),
@@ -363,3 +430,20 @@ def _to_pixel(coordinate: int, size: int) -> int:
     if size <= 0:
         raise ValueError("Screenshot dimensions must be positive")
     return min(size - 1, max(0, int(coordinate * size / 1000)))
+
+
+def _ensure_koophone_tool_success(response: Any) -> None:
+    if getattr(response, "isError", False) or getattr(response, "is_error", False):
+        raise DeviceBackendError(
+            "KooPhone MCP reported a tool failure",
+            kind=DeviceErrorKind.COMMAND_FAILED,
+        )
+
+
+def _list_apps_result_message(response: Any) -> str:
+    content = getattr(response, "content", None)
+    if isinstance(content, list) and len(content) == 1:
+        text = getattr(content[0], "text", None)
+        if isinstance(text, str) and text.strip():
+            return f"KooPhone list_apps result: {text.strip()}"
+    return "KooPhone list_apps completed"

@@ -7,6 +7,8 @@ import json
 from dataclasses import dataclass
 from enum import Enum
 
+import httpx
+
 
 class ActionResultStatus(str, Enum):
     SUCCESS = "success"
@@ -32,7 +34,7 @@ class DeviceBackendError(RuntimeError):
 def classify_device_error(error: BaseException | str) -> DeviceErrorKind:
     if isinstance(error, DeviceBackendError):
         return error.kind
-    if isinstance(error, TimeoutError):
+    if isinstance(error, (TimeoutError, httpx.TimeoutException)):
         return DeviceErrorKind.TIMEOUT
 
     raw_message = str(error)
