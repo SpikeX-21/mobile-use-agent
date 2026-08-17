@@ -464,15 +464,17 @@ class KooPhoneStartupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(transport.tool_calls, [])
 
     async def test_side_effect_timeouts_and_explicit_mcp_failures_have_safe_receipts(self):
-        timeout_transport = ToolCallingMcpTransport([TimeoutError("upstream timeout")])
-        timeout_backend = KooPhoneDeviceBackend(
-            koophone_config(), authenticator=StaticAuthenticator(), transport=timeout_transport
-        )
-        await timeout_backend.initialize()
+        for timeout in (TimeoutError("upstream timeout"), httpx.ReadTimeout("")):
+            with self.subTest(timeout=type(timeout).__name__):
+                timeout_transport = ToolCallingMcpTransport([timeout])
+                timeout_backend = KooPhoneDeviceBackend(
+                    koophone_config(), authenticator=StaticAuthenticator(), transport=timeout_transport
+                )
+                await timeout_backend.initialize()
 
-        timeout_result = await timeout_backend.execute(TapAction(x=1, y=2), (100, 100))
-        self.assertEqual(timeout_result.status.value, "ambiguous")
-        self.assertEqual(timeout_result.error_kind.value, "timeout")
+                timeout_result = await timeout_backend.execute(TapAction(x=1, y=2), (100, 100))
+                self.assertEqual(timeout_result.status.value, "ambiguous")
+                self.assertEqual(timeout_result.error_kind.value, "timeout")
 
         failure_transport = ToolCallingMcpTransport([SimpleNamespace(isError=True)])
         failure_backend = KooPhoneDeviceBackend(
