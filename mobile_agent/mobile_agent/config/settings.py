@@ -70,6 +70,26 @@ class AdbConfig(BaseModel):
     oracle_package: str = "com.autonavi.minimap"
 
 
+class KooPhoneConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    environment: str = Field(min_length=1)
+    mcp_url: str = Field(min_length=1)
+    instance_id: str = Field(min_length=1)
+    tls_verify: bool = True
+    ca_bundle_path: Path | None = None
+    iam_auth_url: str = Field(min_length=1)
+    iam_domain: str = Field(min_length=1)
+    iam_username: str = Field(min_length=1)
+    iam_password: SecretStr
+    iam_project: str = Field(min_length=1)
+    jks_path: Path
+    jks_store_password: SecretStr
+    jks_key_password: SecretStr
+    jks_alias: str = Field(default="koophone", min_length=1)
+    jwt_ttl_minutes: int = Field(default=1440, ge=1, le=1440)
+
+
 class MCPConfig(BaseModel):
     """MCP配置"""
 
@@ -100,7 +120,7 @@ class Settings(BaseSettings):
         port=int(os.environ.get("UVICORN_SERVER_PORT", 8000)),
     )
     # 环境配置
-    env: str = os.environ.get("ENV", "production")
+    env: str = Field(default_factory=lambda: os.environ.get("ENV", "production"))
     model_provider: str = Field(
         default_factory=lambda: os.environ.get("MODEL_PROVIDER", "doubao")
     )
@@ -141,6 +161,62 @@ class Settings(BaseSettings):
     adb_oracle_package: str = Field(
         default_factory=lambda: os.environ.get(
             "ADB_ORACLE_PACKAGE", "com.autonavi.minimap"
+        )
+    )
+    koophone_mcp_url: str | None = Field(
+        default_factory=lambda: os.environ.get("KOOPHONE_MCP_URL")
+    )
+    koophone_instance_id: str | None = Field(
+        default_factory=lambda: os.environ.get("KOOPHONE_INSTANCE_ID")
+    )
+    koophone_tls_verify: bool = Field(
+        default_factory=lambda: os.environ.get("KOOPHONE_TLS_VERIFY", "true")
+    )
+    koophone_ca_bundle_path: str | None = Field(
+        default_factory=lambda: os.environ.get("KOOPHONE_CA_BUNDLE")
+    )
+    koophone_iam_auth_url: str | None = Field(
+        default_factory=lambda: os.environ.get("KOOPHONE_IAM_AUTH_URL")
+    )
+    koophone_iam_domain: str | None = Field(
+        default_factory=lambda: os.environ.get("KOOPHONE_IAM_DOMAIN")
+    )
+    koophone_iam_username: str | None = Field(
+        default_factory=lambda: os.environ.get("KOOPHONE_IAM_USERNAME")
+    )
+    koophone_iam_password: SecretStr | None = Field(
+        default_factory=lambda: (
+            SecretStr(os.environ["KOOPHONE_IAM_PASSWORD"])
+            if os.environ.get("KOOPHONE_IAM_PASSWORD")
+            else None
+        )
+    )
+    koophone_iam_project: str | None = Field(
+        default_factory=lambda: os.environ.get("KOOPHONE_IAM_PROJECT")
+    )
+    koophone_jks_path: str | None = Field(
+        default_factory=lambda: os.environ.get("KOOPHONE_JKS_PATH")
+    )
+    koophone_jks_store_password: SecretStr | None = Field(
+        default_factory=lambda: (
+            SecretStr(os.environ["KOOPHONE_JKS_STORE_PASSWORD"])
+            if os.environ.get("KOOPHONE_JKS_STORE_PASSWORD")
+            else None
+        )
+    )
+    koophone_jks_key_password: SecretStr | None = Field(
+        default_factory=lambda: (
+            SecretStr(os.environ["KOOPHONE_JKS_KEY_PASSWORD"])
+            if os.environ.get("KOOPHONE_JKS_KEY_PASSWORD")
+            else None
+        )
+    )
+    koophone_jks_alias: str = Field(
+        default_factory=lambda: os.environ.get("KOOPHONE_JKS_ALIAS", "koophone")
+    )
+    koophone_jwt_ttl_minutes: int = Field(
+        default_factory=lambda: int(
+            os.environ.get("KOOPHONE_JWT_TTL_MINUTES", "1440")
         )
     )
     experiment_record_path: str = Field(
@@ -194,6 +270,63 @@ class Settings(BaseSettings):
             command_timeout=self.adb_command_timeout,
             oracle_package=self.adb_oracle_package,
         )
+
+    def get_koophone_config(self) -> KooPhoneConfig:
+        from mobile_agent.agent.provider import ProviderConfigurationError
+
+        required = {
+            "KOOPHONE_MCP_URL": self.koophone_mcp_url,
+            "KOOPHONE_INSTANCE_ID": self.koophone_instance_id,
+            "KOOPHONE_IAM_AUTH_URL": self.koophone_iam_auth_url,
+            "KOOPHONE_IAM_DOMAIN": self.koophone_iam_domain,
+            "KOOPHONE_IAM_USERNAME": self.koophone_iam_username,
+            "KOOPHONE_IAM_PASSWORD": self.koophone_iam_password,
+            "KOOPHONE_IAM_PROJECT": self.koophone_iam_project,
+            "KOOPHONE_JKS_PATH": self.koophone_jks_path,
+            "KOOPHONE_JKS_STORE_PASSWORD": self.koophone_jks_store_password,
+            "KOOPHONE_JKS_KEY_PASSWORD": self.koophone_jks_key_password,
+        }
+        missing = [
+            name
+            for name, value in required.items()
+            if value is None or (isinstance(value, str) and not value.strip())
+        ]
+        if missing:
+            raise ProviderConfigurationError(
+                "KooPhone provider requires environment variables: "
+                + ", ".join(missing)
+            )
+        if not self.koophone_tls_verify and self.env.strip().lower() != "poc":
+            raise ProviderConfigurationError(
+                "KOOPHONE_TLS_VERIFY=false is allowed only when ENV=poc"
+            )
+
+        try:
+            return KooPhoneConfig(
+                environment=self.env,
+                mcp_url=self.koophone_mcp_url,
+                instance_id=self.koophone_instance_id,
+                tls_verify=self.koophone_tls_verify,
+                ca_bundle_path=(
+                    Path(self.koophone_ca_bundle_path)
+                    if self.koophone_ca_bundle_path
+                    else None
+                ),
+                iam_auth_url=self.koophone_iam_auth_url,
+                iam_domain=self.koophone_iam_domain,
+                iam_username=self.koophone_iam_username,
+                iam_password=self.koophone_iam_password,
+                iam_project=self.koophone_iam_project,
+                jks_path=Path(self.koophone_jks_path),
+                jks_store_password=self.koophone_jks_store_password,
+                jks_key_password=self.koophone_jks_key_password,
+                jks_alias=self.koophone_jks_alias,
+                jwt_ttl_minutes=self.koophone_jwt_ttl_minutes,
+            )
+        except ValidationError:
+            raise ProviderConfigurationError(
+                "Invalid KooPhone provider configuration"
+            ) from None
 
     def _replace_env_vars(self, config_data):
         """递归替换配置中的环境变量占位符 比如${ARK_API_KEY} 变成 环境变量中的值"""

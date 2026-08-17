@@ -148,6 +148,13 @@ def create_device_backend(provider_name: str, **dependencies: Any) -> DeviceBack
         if "config" not in dependencies:
             dependencies["config"] = get_settings().get_adb_config()
         return AdbDeviceBackend(**dependencies)
+    if normalized_name == "koophone_mcp":
+        from mobile_agent.agent.mobile.koophone import KooPhoneDeviceBackend
+        from mobile_agent.config.settings import get_settings
+
+        if "config" not in dependencies:
+            dependencies["config"] = get_settings().get_koophone_config()
+        return KooPhoneDeviceBackend(**dependencies)
     if normalized_name == "vendor_mcp":
         raise ProviderNotImplementedError(
             "Device provider 'vendor_mcp' is not implemented"

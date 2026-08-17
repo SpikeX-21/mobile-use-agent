@@ -17,6 +17,9 @@ dependencies = [
     "openai>=1.90.0",
     "langchain>=0.3.25",
     "langchain-openai>=0.3.24",
+    "pyjks>=20.0.0",
+    "PyJWT>=2.10.1,<3",
+    "cryptography>=44,<46",
     "volcengine>=1.0.190",
 ]
 

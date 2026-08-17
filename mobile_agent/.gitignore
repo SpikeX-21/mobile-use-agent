@@ -37,6 +37,7 @@ logs/
 
 mcp.json
 debug-mcp.sh
+*.jks
 /bin
 /mcp-server/
 mobile-agent*.zip

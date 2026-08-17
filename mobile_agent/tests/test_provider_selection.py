@@ -22,10 +22,80 @@ from mobile_agent.agent.llm.provider import (
 )
 from mobile_agent.agent.provider import ProviderConfigurationError, ProviderNotImplementedError
 from mobile_agent.agent.mobile.backend import McpDeviceBackend, create_device_backend
+from mobile_agent.agent.mobile.koophone import KooPhoneDeviceBackend
 from mobile_agent.config.settings import AdbConfig, KimiConfig, Settings
+from tests.test_koophone_auth import koophone_config
 
 
 class ProviderSelectionTests(unittest.TestCase):
+    def test_reads_complete_koophone_configuration_without_exposing_secrets(self):
+        environment = {
+            "ENV": "poc",
+            "KOOPHONE_MCP_URL": "https://mcp.example.test/mcp",
+            "KOOPHONE_INSTANCE_ID": "instance-test-1",
+            "KOOPHONE_TLS_VERIFY": "false",
+            "KOOPHONE_IAM_AUTH_URL": "https://iam.example.test/v3/auth/tokens",
+            "KOOPHONE_IAM_DOMAIN": "domain-test",
+            "KOOPHONE_IAM_USERNAME": "user-test",
+            "KOOPHONE_IAM_PASSWORD": "iam-secret-value",
+            "KOOPHONE_IAM_PROJECT": "region-test",
+            "KOOPHONE_JKS_PATH": "/tmp/test-koophone.jks",
+            "KOOPHONE_JKS_STORE_PASSWORD": "store-secret-value",
+            "KOOPHONE_JKS_KEY_PASSWORD": "key-secret-value",
+            "KOOPHONE_JKS_ALIAS": "koophone",
+            "KOOPHONE_JWT_TTL_MINUTES": "1440",
+        }
+
+        with patch.dict(os.environ, environment, clear=True):
+            config = Settings().get_koophone_config()
+
+        self.assertEqual(str(config.mcp_url), "https://mcp.example.test/mcp")
+        self.assertEqual(config.instance_id, "instance-test-1")
+        self.assertFalse(config.tls_verify)
+        self.assertEqual(config.jwt_ttl_minutes, 1440)
+        self.assertNotIn("iam-secret-value", repr(config))
+        self.assertNotIn("store-secret-value", repr(config))
+        self.assertNotIn("key-secret-value", repr(config))
+
+    def test_koophone_configuration_reports_missing_names_not_secret_values(self):
+        with patch.dict(os.environ, {"ENV": "poc"}, clear=True):
+            settings = Settings(device_provider="koophone_mcp")
+
+        with self.assertRaises(ProviderConfigurationError) as raised:
+            settings.get_koophone_config()
+
+        message = str(raised.exception)
+        self.assertIn("KOOPHONE_MCP_URL", message)
+        self.assertIn("KOOPHONE_IAM_PASSWORD", message)
+        self.assertNotIn("iam-secret-value", message)
+        self.assertNotIn("store-secret-value", message)
+        self.assertNotIn("key-secret-value", message)
+
+    def test_koophone_insecure_tls_is_rejected_outside_poc(self):
+        environment = {
+            "ENV": "production",
+            "KOOPHONE_MCP_URL": "https://mcp.example.test/mcp",
+            "KOOPHONE_INSTANCE_ID": "instance-test-1",
+            "KOOPHONE_TLS_VERIFY": "false",
+            "KOOPHONE_IAM_AUTH_URL": "https://iam.example.test/v3/auth/tokens",
+            "KOOPHONE_IAM_DOMAIN": "domain-test",
+            "KOOPHONE_IAM_USERNAME": "user-test",
+            "KOOPHONE_IAM_PASSWORD": "iam-secret-value",
+            "KOOPHONE_IAM_PROJECT": "region-test",
+            "KOOPHONE_JKS_PATH": "/tmp/test-koophone.jks",
+            "KOOPHONE_JKS_STORE_PASSWORD": "store-secret-value",
+            "KOOPHONE_JKS_KEY_PASSWORD": "key-secret-value",
+        }
+
+        with patch.dict(os.environ, environment, clear=True):
+            settings = Settings(device_provider="koophone_mcp")
+
+        with self.assertRaisesRegex(
+            ProviderConfigurationError,
+            "KOOPHONE_TLS_VERIFY=false.*ENV=poc",
+        ):
+            settings.get_koophone_config()
+
     def test_defaults_preserve_the_doubao_mcp_runtime(self):
         with patch.dict(os.environ, {}, clear=True):
             settings = Settings()
@@ -75,6 +145,17 @@ class ProviderSelectionTests(unittest.TestCase):
 
         self.assertEqual(kimi.name, "kimi")
         self.assertEqual(adb.name, "adb")
+
+    def test_koophone_factory_accepts_explicit_boundary_dependencies(self):
+        backend = create_device_backend(
+            "koophone_mcp",
+            config=koophone_config(),
+            authenticator=object(),
+            transport=object(),
+        )
+
+        self.assertIsInstance(backend, KooPhoneDeviceBackend)
+        self.assertEqual(backend.name, "koophone_mcp")
 
     def test_selected_provider_errors_name_missing_env_without_secret_values(self):
         with patch.dict(os.environ, {}, clear=True):
