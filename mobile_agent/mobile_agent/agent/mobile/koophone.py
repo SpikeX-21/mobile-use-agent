@@ -12,7 +12,16 @@ import httpx
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
-from mobile_agent.agent.actions import CanonicalAction
+from mobile_agent.agent.actions import (
+    BackAction,
+    CanonicalAction,
+    FailAction,
+    FinishAction,
+    HomeAction,
+    MenuAction,
+    TapAction,
+    WaitAction,
+)
 from mobile_agent.agent.infra.model import ToolCall
 from mobile_agent.agent.mobile.koophone_auth import (
     HuaweiIamTokenProvider,
@@ -20,7 +29,15 @@ from mobile_agent.agent.mobile.koophone_auth import (
     KooPhoneAuthenticator,
 )
 from mobile_agent.agent.mobile.koophone_tls import build_tls_verification
-from mobile_agent.agent.mobile.result import ActionResult
+from mobile_agent.agent.mobile.koophone_observation import (
+    normalize_koophone_screenshot,
+)
+from mobile_agent.agent.mobile.result import (
+    ActionResult,
+    DeviceBackendError,
+    DeviceErrorKind,
+    classify_device_error,
+)
 from mobile_agent.agent.provider import (
     ProviderConfigurationError,
     ProviderNotImplementedError,
@@ -55,6 +72,8 @@ class KooPhoneMcpTransport(Protocol):
     async def connect(self, headers: dict[str, str]) -> set[str]: ...
 
     async def close(self) -> None: ...
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any: ...
 
 
 class KooPhoneOperationOutcomeUncertain(RuntimeError):
@@ -126,6 +145,11 @@ class StreamableHttpKooPhoneTransport:
         await self._exit_stack.aclose()
         self._session = None
 
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        if self._session is None:
+            raise ProviderConfigurationError("KooPhone MCP session is not connected")
+        return await self._session.call_tool(name, arguments=arguments)
+
 
 class KooPhoneDeviceBackend:
     name = "koophone_mcp"
@@ -137,6 +161,7 @@ class KooPhoneDeviceBackend:
         authenticator: KooPhoneAuthHeaders | None = None,
         transport: KooPhoneMcpTransport | None = None,
     ) -> None:
+        self._config = config
         self._authenticator = authenticator or KooPhoneAuthenticator(
             iam_provider=HuaweiIamTokenProvider(config),
             jwt_provider=JksJwtProvider(config),
@@ -240,9 +265,22 @@ class KooPhoneDeviceBackend:
         self._session_headers = None
 
     async def take_screenshot(self) -> dict[str, Any]:
-        raise ProviderNotImplementedError(
-            "KooPhone screenshot execution is delivered by Issue #14"
-        )
+        final_error: DeviceBackendError | None = None
+        for _ in range(2):
+            try:
+                response = await self._call_tool(
+                    "get_screenshot", {}, retry_safe=True
+                )
+                return normalize_koophone_screenshot(response)
+            except DeviceBackendError as error:
+                final_error = error
+            except Exception as error:
+                final_error = DeviceBackendError(
+                    "KooPhone screenshot request failed",
+                    kind=classify_device_error(error),
+                )
+        assert final_error is not None
+        raise final_error
 
     async def prepare_task(self, user_prompt: str) -> None:
         del user_prompt
@@ -252,19 +290,65 @@ class KooPhoneDeviceBackend:
         action: CanonicalAction,
         screenshot_dimensions: tuple[int, int],
     ) -> ActionResult:
-        del action, screenshot_dimensions
-        raise ProviderNotImplementedError(
-            "KooPhone action execution is delivered by Issue #15"
-        )
+        if isinstance(action, WaitAction):
+            await asyncio.sleep(action.duration_ms / 1000)
+            return ActionResult.success(
+                f"Waited {action.duration_ms / 1000:g}s for the UI to settle"
+            )
+        if not isinstance(action, (TapAction, HomeAction, BackAction, MenuAction)):
+            raise ProviderNotImplementedError(
+                "KooPhone action execution is delivered by Issue #15"
+            )
+        tool_call = self.to_tool_call(action, screenshot_dimensions)
+        try:
+            await self._call_tool(
+                tool_call["name"], tool_call["arguments"] or {}, retry_safe=False
+            )
+        except KooPhoneOperationOutcomeUncertain:
+            return ActionResult.ambiguous(
+                f"KooPhone {action.type} outcome is uncertain after authentication rejection",
+                DeviceErrorKind.COMMAND_FAILED,
+            )
+        except Exception as error:
+            return ActionResult.failed(
+                f"KooPhone {action.type} failed", classify_device_error(error)
+            )
+        return ActionResult.success(f"KooPhone {action.type} dispatched")
 
     def to_tool_call(
         self,
         action: CanonicalAction,
         screenshot_dimensions: tuple[int, int],
     ) -> ToolCall:
-        del action, screenshot_dimensions
+        if isinstance(action, TapAction):
+            width, height = screenshot_dimensions
+            return {
+                "name": "tap",
+                "arguments": {
+                    "x": _to_pixel(action.x, width),
+                    "y": _to_pixel(action.y, height),
+                },
+            }
+        if isinstance(action, (HomeAction, BackAction, MenuAction)):
+            key = {"home": "HOME", "back": "BACK", "menu": "MENU"}[action.type]
+            return {"name": "send_key", "arguments": {"key": key}}
+        if isinstance(action, WaitAction):
+            return {"name": "wait", "arguments": {"t": action.duration_ms / 1000}}
+        if isinstance(action, FinishAction):
+            return {"name": "finished", "arguments": {"content": action.summary}}
+        if isinstance(action, FailAction):
+            return {"name": "call_user", "arguments": {"content": action.reason}}
         raise ProviderNotImplementedError(
             "KooPhone action mapping is delivered by Issue #15"
+        )
+
+    async def _call_tool(
+        self, name: str, arguments: dict[str, Any], *, retry_safe: bool
+    ) -> Any:
+        server_arguments = {**arguments, "instanceId": self._config.instance_id}
+        return await self.run_authenticated_operation(
+            lambda: self._transport.call_tool(name, server_arguments),
+            retry_safe=retry_safe,
         )
 
     async def verify_completion(self, action: CanonicalAction) -> bool | None:
@@ -273,3 +357,9 @@ class KooPhoneDeviceBackend:
 
     async def close(self) -> None:
         await self._close_transport()
+
+
+def _to_pixel(coordinate: int, size: int) -> int:
+    if size <= 0:
+        raise ValueError("Screenshot dimensions must be positive")
+    return min(size - 1, max(0, int(coordinate * size / 1000)))
