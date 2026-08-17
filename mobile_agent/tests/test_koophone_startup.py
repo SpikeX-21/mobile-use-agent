@@ -3,12 +3,17 @@
 
 from __future__ import annotations
 
+import base64
+import io
 import traceback
 import unittest
+from types import SimpleNamespace
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from PIL import Image
 
+from mobile_agent.agent.actions import HomeAction, TapAction
 from mobile_agent.agent.mobile.koophone import (
     KOOPHONE_REQUIRED_TOOLS,
     KooPhoneDeviceBackend,
@@ -17,6 +22,12 @@ from mobile_agent.agent.mobile.koophone import (
 )
 from mobile_agent.agent.provider import ProviderConfigurationError
 from tests.test_koophone_auth import koophone_config
+
+
+def screenshot_base64(width: int = 80, height: int = 60) -> str:
+    output = io.BytesIO()
+    Image.new("RGB", (width, height), "white").save(output, format="PNG")
+    return base64.b64encode(output.getvalue()).decode("ascii")
 
 
 class StaticAuthenticator:
@@ -84,6 +95,17 @@ class SequenceMcpTransport(RecordingMcpTransport):
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
+
+
+class ToolCallingMcpTransport(RecordingMcpTransport):
+    def __init__(self, tool_results):
+        super().__init__()
+        self.tool_results = list(tool_results)
+        self.tool_calls = []
+
+    async def call_tool(self, name, arguments):
+        self.tool_calls.append((name, arguments))
+        return self.tool_results.pop(0)
 
 
 class KooPhoneStartupTests(unittest.IsolatedAsyncioTestCase):
@@ -306,6 +328,62 @@ class KooPhoneStartupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(operation_calls, 1)
         self.assertEqual(transport.connect_calls, 2)
         self.assertEqual(authenticator.invalidations, 2)
+
+    async def test_screenshot_uses_only_get_screenshot_and_injects_instance_id(self):
+        encoded = screenshot_base64()
+        transport = ToolCallingMcpTransport(
+            [SimpleNamespace(content=[SimpleNamespace(text=encoded)])]
+        )
+        backend = KooPhoneDeviceBackend(
+            koophone_config(), authenticator=StaticAuthenticator(), transport=transport
+        )
+        await backend.initialize()
+
+        observation = await backend.take_screenshot()
+
+        self.assertEqual(observation["screenshot_dimensions"], (80, 60))
+        self.assertTrue(observation["screenshot"].startswith("data:image/png;base64,"))
+        self.assertEqual(
+            transport.tool_calls,
+            [("get_screenshot", {"instanceId": "instance-test-1"})],
+        )
+
+    async def test_tap_and_home_are_mapped_without_exposing_instance_id_to_agent(self):
+        transport = ToolCallingMcpTransport(["tap ok", "home ok"])
+        backend = KooPhoneDeviceBackend(
+            koophone_config(), authenticator=StaticAuthenticator(), transport=transport
+        )
+        await backend.initialize()
+
+        tap_call = backend.to_tool_call(TapAction(x=1000, y=500), (80, 60))
+        await backend.execute(TapAction(x=1000, y=500), (80, 60))
+        await backend.execute(HomeAction(), (80, 60))
+
+        self.assertEqual(tap_call, {"name": "tap", "arguments": {"x": 79, "y": 30}})
+        self.assertNotIn("instanceId", tap_call["arguments"])
+        self.assertEqual(
+            transport.tool_calls,
+            [
+                ("tap", {"instanceId": "instance-test-1", "x": 79, "y": 30}),
+                ("send_key", {"instanceId": "instance-test-1", "key": "HOME"}),
+            ],
+        )
+
+    async def test_configured_instance_id_cannot_be_overridden_by_tool_arguments(self):
+        transport = ToolCallingMcpTransport(["tap ok"])
+        backend = KooPhoneDeviceBackend(
+            koophone_config(), authenticator=StaticAuthenticator(), transport=transport
+        )
+        await backend.initialize()
+
+        await backend._call_tool(
+            "tap", {"instanceId": "other-instance", "x": 1, "y": 2}, retry_safe=False
+        )
+
+        self.assertEqual(
+            transport.tool_calls,
+            [("tap", {"instanceId": "instance-test-1", "x": 1, "y": 2})],
+        )
 
 
 if __name__ == "__main__":
