@@ -12,6 +12,7 @@ from mcp.server.fastmcp import FastMCP
 from mobile_agent.agent.mobile.koophone import (
     KOOPHONE_REQUIRED_TOOLS,
     KooPhoneDeviceBackend,
+    KooPhoneOperationOutcomeUncertain,
     StreamableHttpKooPhoneTransport,
 )
 from mobile_agent.agent.provider import ProviderConfigurationError
@@ -44,6 +45,45 @@ class SecretEchoingMcpTransport(RecordingMcpTransport):
     async def connect(self, headers: dict[str, str]) -> set[str]:
         del headers
         raise RuntimeError("upstream echoed jwt-token-value iam-token-value")
+
+
+class RotatingAuthenticator:
+    def __init__(self):
+        self.header_calls = 0
+        self.invalidations = 0
+        self._version = 1
+
+    async def create_headers(self) -> dict[str, str]:
+        self.header_calls += 1
+        return {
+            "Authorization": f"Bearer jwt-token-{self._version}",
+            "x-auth-token": f"iam-token-{self._version}",
+        }
+
+    async def invalidate(self) -> None:
+        self.invalidations += 1
+        self._version += 1
+
+
+def authentication_error(status_code: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "https://mcp.example.test/mcp")
+    response = httpx.Response(status_code, request=request)
+    return httpx.HTTPStatusError("redacted upstream error", request=request, response=response)
+
+
+class SequenceMcpTransport(RecordingMcpTransport):
+    def __init__(self, outcomes):
+        super().__init__()
+        self._outcomes = list(outcomes)
+        self.connect_calls = 0
+
+    async def connect(self, headers: dict[str, str]) -> set[str]:
+        self.connect_calls += 1
+        self.headers = headers
+        outcome = self._outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
 
 
 class KooPhoneStartupTests(unittest.IsolatedAsyncioTestCase):
@@ -146,6 +186,126 @@ class KooPhoneStartupTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("KooPhone MCP startup probe failed", rendered)
         self.assertNotIn("jwt-token-value", rendered)
         self.assertNotIn("iam-token-value", rendered)
+
+    async def test_first_authentication_rejection_refreshes_and_reconnects_once(self):
+        authenticator = RotatingAuthenticator()
+        transport = SequenceMcpTransport(
+            [authentication_error(401), set(KOOPHONE_REQUIRED_TOOLS)]
+        )
+        backend = KooPhoneDeviceBackend(
+            koophone_config(), authenticator=authenticator, transport=transport
+        )
+
+        await backend.initialize()
+
+        self.assertEqual(transport.connect_calls, 2)
+        self.assertEqual(authenticator.invalidations, 1)
+        self.assertEqual(authenticator.header_calls, 2)
+        self.assertEqual(transport.headers["Authorization"], "Bearer jwt-token-2")
+
+    async def test_second_authentication_rejection_fails_without_a_third_connect(self):
+        authenticator = RotatingAuthenticator()
+        transport = SequenceMcpTransport(
+            [authentication_error(401), authentication_error(403)]
+        )
+        backend = KooPhoneDeviceBackend(
+            koophone_config(), authenticator=authenticator, transport=transport
+        )
+
+        with self.assertRaisesRegex(ProviderConfigurationError, "startup probe failed"):
+            await backend.initialize()
+
+        self.assertEqual(transport.connect_calls, 2)
+        self.assertEqual(authenticator.invalidations, 2)
+        self.assertEqual(authenticator.header_calls, 2)
+
+    async def test_non_authentication_failure_is_not_retried_or_invalidated(self):
+        authenticator = RotatingAuthenticator()
+        transport = SequenceMcpTransport([authentication_error(503)])
+        backend = KooPhoneDeviceBackend(
+            koophone_config(), authenticator=authenticator, transport=transport
+        )
+
+        with self.assertRaisesRegex(ProviderConfigurationError, "startup probe failed"):
+            await backend.initialize()
+
+        self.assertEqual(transport.connect_calls, 1)
+        self.assertEqual(authenticator.invalidations, 0)
+
+    async def test_read_operation_recovers_once_after_authentication_rejection(self):
+        authenticator = RotatingAuthenticator()
+        transport = SequenceMcpTransport(
+            [set(KOOPHONE_REQUIRED_TOOLS), set(KOOPHONE_REQUIRED_TOOLS)]
+        )
+        backend = KooPhoneDeviceBackend(
+            koophone_config(), authenticator=authenticator, transport=transport
+        )
+        await backend.initialize()
+        operation_calls = 0
+
+        async def read_operation() -> str:
+            nonlocal operation_calls
+            operation_calls += 1
+            if operation_calls == 1:
+                raise authentication_error(401)
+            return "fresh observation"
+
+        result = await backend.run_authenticated_operation(
+            read_operation, retry_safe=True
+        )
+
+        self.assertEqual(result, "fresh observation")
+        self.assertEqual(operation_calls, 2)
+        self.assertEqual(transport.connect_calls, 2)
+        self.assertEqual(authenticator.invalidations, 1)
+
+    async def test_side_effect_authentication_rejection_is_uncertain_and_not_replayed(self):
+        authenticator = RotatingAuthenticator()
+        transport = SequenceMcpTransport([set(KOOPHONE_REQUIRED_TOOLS)])
+        backend = KooPhoneDeviceBackend(
+            koophone_config(), authenticator=authenticator, transport=transport
+        )
+        await backend.initialize()
+        operation_calls = 0
+
+        async def side_effect_operation() -> None:
+            nonlocal operation_calls
+            operation_calls += 1
+            raise authentication_error(403)
+
+        with self.assertRaisesRegex(
+            KooPhoneOperationOutcomeUncertain, "outcome is uncertain"
+        ):
+            await backend.run_authenticated_operation(
+                side_effect_operation, retry_safe=False
+            )
+
+        self.assertEqual(operation_calls, 1)
+        self.assertEqual(transport.connect_calls, 1)
+        self.assertEqual(authenticator.invalidations, 1)
+
+    async def test_reconnection_failure_stops_read_operation_without_retrying_it(self):
+        authenticator = RotatingAuthenticator()
+        transport = SequenceMcpTransport(
+            [set(KOOPHONE_REQUIRED_TOOLS), authentication_error(403)]
+        )
+        backend = KooPhoneDeviceBackend(
+            koophone_config(), authenticator=authenticator, transport=transport
+        )
+        await backend.initialize()
+        operation_calls = 0
+
+        async def read_operation() -> None:
+            nonlocal operation_calls
+            operation_calls += 1
+            raise authentication_error(401)
+
+        with self.assertRaisesRegex(ProviderConfigurationError, "startup probe failed"):
+            await backend.run_authenticated_operation(read_operation, retry_safe=True)
+
+        self.assertEqual(operation_calls, 1)
+        self.assertEqual(transport.connect_calls, 2)
+        self.assertEqual(authenticator.invalidations, 2)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
@@ -271,6 +272,128 @@ class KooPhoneAuthenticatorTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.assertNotIn("instanceId", headers)
+
+    async def test_caches_both_tokens_until_the_early_refresh_window(self):
+        now = datetime(2030, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+
+        class CountingIamTokenProvider:
+            calls = 0
+
+            async def fetch_token(self) -> ExpiringSecret:
+                self.calls += 1
+                return ExpiringSecret(
+                    value=SecretStr(f"iam-token-{self.calls}"),
+                    expires_at=now + timedelta(minutes=10),
+                )
+
+        class CountingJwtTokenProvider:
+            calls = 0
+
+            def issue_token(self) -> ExpiringSecret:
+                self.calls += 1
+                return ExpiringSecret(
+                    value=SecretStr(f"jwt-token-{self.calls}"),
+                    expires_at=now + timedelta(minutes=10),
+                )
+
+        iam_provider = CountingIamTokenProvider()
+        jwt_provider = CountingJwtTokenProvider()
+        authenticator = KooPhoneAuthenticator(
+            iam_provider=iam_provider,
+            jwt_provider=jwt_provider,
+            clock=lambda: now,
+        )
+
+        first_headers = await authenticator.create_headers()
+        second_headers = await authenticator.create_headers()
+
+        self.assertEqual(first_headers, second_headers)
+        self.assertEqual(iam_provider.calls, 1)
+        self.assertEqual(jwt_provider.calls, 1)
+
+    async def test_concurrent_refreshes_are_single_flight(self):
+        now = datetime(2030, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+
+        class SlowIamTokenProvider:
+            calls = 0
+
+            async def fetch_token(self) -> ExpiringSecret:
+                self.calls += 1
+                await asyncio.sleep(0)
+                return ExpiringSecret(
+                    value=SecretStr("iam-token-value"),
+                    expires_at=now + timedelta(minutes=10),
+                )
+
+        class CountingJwtTokenProvider:
+            calls = 0
+
+            def issue_token(self) -> ExpiringSecret:
+                self.calls += 1
+                return ExpiringSecret(
+                    value=SecretStr("jwt-token-value"),
+                    expires_at=now + timedelta(minutes=10),
+                )
+
+        iam_provider = SlowIamTokenProvider()
+        jwt_provider = CountingJwtTokenProvider()
+        authenticator = KooPhoneAuthenticator(
+            iam_provider=iam_provider,
+            jwt_provider=jwt_provider,
+            clock=lambda: now,
+        )
+
+        headers = await asyncio.gather(
+            *(authenticator.create_headers() for _ in range(10))
+        )
+
+        self.assertEqual(len(headers), 10)
+        self.assertTrue(all(header == headers[0] for header in headers))
+        self.assertEqual(iam_provider.calls, 1)
+        self.assertEqual(jwt_provider.calls, 1)
+
+    async def test_refreshes_tokens_five_minutes_before_expiry_and_after_invalidation(self):
+        now = datetime(2030, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+        current_time = [now]
+
+        class CountingIamTokenProvider:
+            calls = 0
+
+            async def fetch_token(self) -> ExpiringSecret:
+                self.calls += 1
+                return ExpiringSecret(
+                    value=SecretStr(f"iam-token-{self.calls}"),
+                    expires_at=current_time[0] + timedelta(minutes=10),
+                )
+
+        class CountingJwtTokenProvider:
+            calls = 0
+
+            def issue_token(self) -> ExpiringSecret:
+                self.calls += 1
+                return ExpiringSecret(
+                    value=SecretStr(f"jwt-token-{self.calls}"),
+                    expires_at=current_time[0] + timedelta(minutes=10),
+                )
+
+        iam_provider = CountingIamTokenProvider()
+        jwt_provider = CountingJwtTokenProvider()
+        authenticator = KooPhoneAuthenticator(
+            iam_provider=iam_provider,
+            jwt_provider=jwt_provider,
+            clock=lambda: current_time[0],
+        )
+
+        await authenticator.create_headers()
+        current_time[0] += timedelta(minutes=5)
+        refreshed_headers = await authenticator.create_headers()
+        await authenticator.invalidate()
+        invalidated_headers = await authenticator.create_headers()
+
+        self.assertEqual(refreshed_headers["x-auth-token"], "iam-token-2")
+        self.assertEqual(refreshed_headers["Authorization"], "Bearer jwt-token-2")
+        self.assertEqual(invalidated_headers["x-auth-token"], "iam-token-3")
+        self.assertEqual(invalidated_headers["Authorization"], "Bearer jwt-token-3")
 
 
 if __name__ == "__main__":

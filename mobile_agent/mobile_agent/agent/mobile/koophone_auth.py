@@ -161,22 +161,48 @@ class JwtTokenSource(Protocol):
 
 
 class KooPhoneAuthenticator:
-    """Create the dual-header credentials required by KooPhone MCP."""
+    """Create and retain the in-memory dual credentials required by KooPhone MCP."""
 
     def __init__(
         self,
         *,
         iam_provider: IamTokenSource,
         jwt_provider: JwtTokenSource,
+        clock: Callable[[], datetime] | None = None,
+        refresh_before: timedelta = timedelta(minutes=5),
     ) -> None:
         self._iam_provider = iam_provider
         self._jwt_provider = jwt_provider
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._refresh_before = refresh_before
+        self._iam_token: ExpiringSecret | None = None
+        self._jwt_token: ExpiringSecret | None = None
+        self._refresh_lock = asyncio.Lock()
+
+    async def invalidate(self) -> None:
+        """Discard both credentials after an authentication rejection."""
+
+        async with self._refresh_lock:
+            self._iam_token = None
+            self._jwt_token = None
+
+    def _is_current(self, secret: ExpiringSecret | None) -> bool:
+        if secret is None:
+            return False
+        now = self._clock()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        return secret.expires_at > now + self._refresh_before
 
     async def create_headers(self) -> dict[str, str]:
-        iam_token, jwt_token = await asyncio.gather(
-            self._iam_provider.fetch_token(),
-            asyncio.to_thread(self._jwt_provider.issue_token),
-        )
+        async with self._refresh_lock:
+            if not self._is_current(self._iam_token):
+                self._iam_token = await self._iam_provider.fetch_token()
+            if not self._is_current(self._jwt_token):
+                self._jwt_token = await asyncio.to_thread(self._jwt_provider.issue_token)
+
+            iam_token = self._iam_token
+            jwt_token = self._jwt_token
         return {
             "Authorization": f"Bearer {jwt_token.value.get_secret_value()}",
             "x-auth-token": iam_token.value.get_secret_value(),

@@ -4,8 +4,9 @@
 from __future__ import annotations
 
 from contextlib import AsyncExitStack
+import inspect
 import logging
-from typing import Any, Callable, Protocol
+from typing import Any, Awaitable, Callable, Protocol, TypeVar
 
 import httpx
 from mcp import ClientSession
@@ -28,6 +29,8 @@ from mobile_agent.config.settings import KooPhoneConfig
 
 
 logger = logging.getLogger(__name__)
+
+OperationResult = TypeVar("OperationResult")
 
 KOOPHONE_REQUIRED_TOOLS = frozenset(
     {
@@ -52,6 +55,20 @@ class KooPhoneMcpTransport(Protocol):
     async def connect(self, headers: dict[str, str]) -> set[str]: ...
 
     async def close(self) -> None: ...
+
+
+class KooPhoneOperationOutcomeUncertain(RuntimeError):
+    """A side-effect request may have reached KooPhone before auth failed."""
+
+
+def is_authentication_rejection(error: BaseException) -> bool:
+    """Recognize only explicit HTTP authentication rejections for recovery."""
+
+    response = getattr(error, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code is None:
+        status_code = getattr(error, "status_code", None)
+    return status_code in {401, 403}
 
 
 class StreamableHttpKooPhoneTransport:
@@ -125,26 +142,102 @@ class KooPhoneDeviceBackend:
             jwt_provider=JksJwtProvider(config),
         )
         self._transport = transport or StreamableHttpKooPhoneTransport(config)
+        self._session_headers: dict[str, str] | None = None
 
     async def initialize(self, **connection: str) -> None:
         del connection
-        headers = await self._authenticator.create_headers()
+        await self._connect_with_recovery()
+
+    async def run_authenticated_operation(
+        self,
+        operation: Callable[[], Awaitable[OperationResult]],
+        *,
+        retry_safe: bool,
+    ) -> OperationResult:
+        """Run one MCP operation with bounded auth recovery semantics.
+
+        Read-only operations may reconnect and retry once. A side-effect operation
+        that receives 401/403 is never replayed because upstream acceptance is
+        unknown.
+        """
+
+        await self._connect_with_recovery()
         try:
-            available_tools = await self._transport.connect(headers)
-        except Exception:
+            return await operation()
+        except Exception as error:
+            if not is_authentication_rejection(error):
+                raise
+            await self._close_transport()
+            await self._invalidate_credentials()
+            if not retry_safe:
+                raise KooPhoneOperationOutcomeUncertain(
+                    "KooPhone side-effect outcome is uncertain after authentication rejection"
+                ) from None
+
+        await self._connect_with_recovery(retry_authentication_rejection=False)
+        try:
+            return await operation()
+        except Exception as error:
+            if is_authentication_rejection(error):
+                await self._close_transport()
+                await self._invalidate_credentials()
+                raise ProviderConfigurationError(
+                    "KooPhone MCP operation authentication recovery failed"
+                ) from None
+            raise
+
+    async def _connect_with_recovery(
+        self, *, retry_authentication_rejection: bool = True
+    ) -> None:
+        attempts = 2 if retry_authentication_rejection else 1
+        for attempt in range(attempts):
             try:
-                await self._transport.close()
-            except Exception:
-                pass
-            raise ProviderConfigurationError(
-                "KooPhone MCP startup probe failed"
-            ) from None
+                await self._ensure_authenticated_session()
+            except ProviderConfigurationError:
+                raise
+            except Exception as error:
+                await self._close_transport()
+                if is_authentication_rejection(error):
+                    await self._invalidate_credentials()
+                    if attempt + 1 < attempts:
+                        continue
+                raise ProviderConfigurationError(
+                    "KooPhone MCP startup probe failed"
+                ) from None
+            return
+
+        raise ProviderConfigurationError("KooPhone MCP startup probe failed")
+
+    async def _ensure_authenticated_session(self) -> None:
+        headers = await self._authenticator.create_headers()
+        if headers == self._session_headers:
+            return
+        if self._session_headers is not None:
+            await self._close_transport()
+
+        available_tools = await self._transport.connect(headers)
         missing = sorted(KOOPHONE_REQUIRED_TOOLS - available_tools)
         if missing:
             await self._transport.close()
             raise ProviderConfigurationError(
                 "KooPhone MCP is missing required tools: " + ", ".join(missing)
             )
+        self._session_headers = headers
+
+    async def _invalidate_credentials(self) -> None:
+        invalidate = getattr(self._authenticator, "invalidate", None)
+        if invalidate is None:
+            return
+        result = invalidate()
+        if inspect.isawaitable(result):
+            await result
+
+    async def _close_transport(self) -> None:
+        try:
+            await self._transport.close()
+        except Exception:
+            pass
+        self._session_headers = None
 
     async def take_screenshot(self) -> dict[str, Any]:
         raise ProviderNotImplementedError(
@@ -179,4 +272,4 @@ class KooPhoneDeviceBackend:
         return None
 
     async def close(self) -> None:
-        await self._transport.close()
+        await self._close_transport()
