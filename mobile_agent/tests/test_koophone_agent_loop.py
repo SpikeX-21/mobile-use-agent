@@ -54,9 +54,9 @@ class KooPhoneLoopTransport:
 
 
 class KimiCompletions:
-    def __init__(self):
+    def __init__(self, responses=None):
         self.requests = []
-        self.responses = [
+        self.responses = responses or [
             {"summary": "视觉定位后轻触", "action": {"type": "tap", "x": 500, "y": 500}},
             {"summary": "安全点击完成", "action": {"type": "finish", "summary": "已完成视觉点击"}},
         ]
@@ -135,6 +135,69 @@ class KooPhoneAgentLoopTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn('"tool_name": "tap"', custom_output)
         self.assertIn("已完成视觉点击", custom_output)
+
+    async def test_simulated_alarm_states_follow_idempotent_action_paths(self):
+        cases = {
+            "enabled": [
+                {"summary": "打开闹钟", "action": {"type": "launch_app", "package_name": "com.android.deskclock"}},
+                {"summary": "09:00 已启用", "action": {"type": "finish", "summary": "09:00 已启用"}},
+            ],
+            "disabled": [
+                {"summary": "打开闹钟", "action": {"type": "launch_app", "package_name": "com.android.deskclock"}},
+                {"summary": "启用已有闹钟", "action": {"type": "tap", "x": 900, "y": 500}},
+                {"summary": "确认启用", "action": {"type": "finish", "summary": "09:00 已启用"}},
+            ],
+            "missing": [
+                {"summary": "打开闹钟", "action": {"type": "launch_app", "package_name": "com.android.deskclock"}},
+                {"summary": "新建闹钟", "action": {"type": "tap", "x": 900, "y": 900}},
+                {"summary": "设置九点", "action": {"type": "tap", "x": 500, "y": 500}},
+                {"summary": "保存默认配置", "action": {"type": "tap", "x": 800, "y": 900}},
+                {"summary": "确认新闹钟", "action": {"type": "finish", "summary": "09:00 已启用"}},
+            ],
+        }
+        expected_tools = {
+            "enabled": ["start_app"],
+            "disabled": ["start_app", "tap"],
+            "missing": ["start_app", "tap", "tap", "tap"],
+        }
+
+        for state, responses in cases.items():
+            with self.subTest(state=state):
+                transport = KooPhoneLoopTransport()
+                backend = KooPhoneDeviceBackend(
+                    koophone_config(), authenticator=StaticAuthenticator(), transport=transport
+                )
+                completions = KimiCompletions(responses=list(responses))
+                client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+                def model_factory(name, *, thread_id, is_stream):
+                    return KimiModelProvider(
+                        thread_id=thread_id,
+                        config=KimiConfig(api_key=SecretStr("unit-test-key")),
+                        client=client,
+                    )
+
+                agent = MobileUseAgent(
+                    model_provider_name="kimi",
+                    device_provider_name="koophone_mcp",
+                    model_provider_factory=model_factory,
+                    device_backend_factory=lambda name: backend,
+                )
+                agent.step_interval = 0
+                await agent.initialize("", "", "", "", "", "")
+                async for _ in agent.run(
+                    "确保存在已启用的 09:00 闹钟",
+                    is_stream=False,
+                    task_id=f"alarm-{state}",
+                    session_id="alarm-test",
+                    thread_id=f"alarm-{state}-{uuid.uuid4()}",
+                    sse_connection=asyncio.Event(),
+                    phone_width=90,
+                    phone_height=60,
+                ):
+                    pass
+
+                self.assertEqual([name for name, _ in transport.tool_calls if name != "get_screenshot"], expected_tools[state])
 
 
 if __name__ == "__main__":
