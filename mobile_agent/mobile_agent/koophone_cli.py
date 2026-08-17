@@ -21,6 +21,7 @@ async def run_koophone_vision_demo(
     prompt: str,
     *,
     agent_factory: Callable[..., MobileUseAgent] = MobileUseAgent,
+    outcome_sink: Callable[[str | None], None] | None = None,
 ) -> int:
     """Run one Kimi + KooPhone task without introducing a second agent loop."""
 
@@ -42,6 +43,8 @@ async def run_koophone_vision_demo(
             phone_height=0,
         ):
             chunk_count += 1
+        if outcome_sink is not None:
+            outcome_sink(getattr(agent, "last_terminal_reason", None))
         return chunk_count
     finally:
         await agent.aclose()

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import sys
 from typing import Callable
 
 from mobile_agent.agent.mobile_use_agent import MobileUseAgent
@@ -29,7 +30,15 @@ async def run_koophone_alarm_demo(
 ) -> int:
     """Run the idempotent 09:00 alarm task via the production Kimi adapter."""
 
-    return await run_koophone_vision_demo(ALARM_PROMPT, agent_factory=agent_factory)
+    outcome: list[str | None] = []
+    chunk_count = await run_koophone_vision_demo(
+        ALARM_PROMPT,
+        agent_factory=agent_factory,
+        outcome_sink=outcome.append,
+    )
+    if outcome != ["completed"]:
+        raise RuntimeError(f"KooPhone alarm task did not complete: {outcome[0] if outcome else 'unknown'}")
+    return chunk_count
 
 
 def main() -> None:
@@ -37,7 +46,11 @@ def main() -> None:
         description="Run the real Kimi + KooPhone 09:00 alarm acceptance task"
     )
     parser.parse_args()
-    chunk_count = asyncio.run(run_koophone_alarm_demo())
+    try:
+        chunk_count = asyncio.run(run_koophone_alarm_demo())
+    except RuntimeError as error:
+        print(f"KOOPHONE_ALARM_DEMO=failed reason={error}", file=sys.stderr)
+        raise SystemExit(1) from None
     print(f"KOOPHONE_ALARM_DEMO=finished chunks={chunk_count}")
 
 

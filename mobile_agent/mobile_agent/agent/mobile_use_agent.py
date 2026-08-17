@@ -65,6 +65,7 @@ class MobileUseAgent:
             experiment_record_path or settings.experiment_record_path
         )
         self.cost_calculator = CostCalculator(MobileUseAgent.name)
+        self.last_terminal_reason: str | None = None
 
     async def initialize(
         self,
@@ -220,7 +221,10 @@ class MobileUseAgent:
             raise
         finally:
             if experiment_run is not None:
+                self.last_terminal_reason = experiment_run.terminal_reason
+            if experiment_run is not None:
                 experiment_run.try_record_terminal_once("runtime_ended")
+                self.last_terminal_reason = experiment_run.terminal_reason
             if self.stream:
                 self.logger.info("stream mode, not support cost calculator")
             else:

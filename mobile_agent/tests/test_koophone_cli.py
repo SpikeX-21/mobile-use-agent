@@ -15,6 +15,7 @@ class RecordingAgent:
         self.initialized = False
         self.closed = False
         self.run_prompt = None
+        self.last_terminal_reason = "completed"
 
     async def initialize(self, *connection):
         self.initialized = True

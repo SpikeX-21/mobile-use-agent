@@ -374,6 +374,7 @@ class ExperimentRun:
         self._last_step_number = 0
         self._last_observation_images_used = 0
         self._terminal_recorded = False
+        self.terminal_reason: TerminalReason | None = None
 
     def note_observation_images_used(self, count: int) -> None:
         """Track the model payload size for run-level cancellation records."""
@@ -439,6 +440,7 @@ class ExperimentRun:
             self._last_observation_images_used = images_used
             if terminal_reason is not None:
                 self._terminal_recorded = True
+                self.terminal_reason = terminal_reason
 
     def try_record_step(self, **kwargs: Any) -> bool:
         """Best-effort telemetry that can never alter Agent execution."""
@@ -503,6 +505,7 @@ class ExperimentRun:
                 )
             )
             self._terminal_recorded = True
+            self.terminal_reason = terminal_reason
             return True
 
     def try_record_terminal_once(self, terminal_reason: TerminalReason) -> bool:
