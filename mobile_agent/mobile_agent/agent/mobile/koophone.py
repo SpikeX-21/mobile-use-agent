@@ -5,7 +5,6 @@ from __future__ import annotations
 
 from contextlib import AsyncExitStack
 import logging
-import ssl
 from typing import Any, Callable, Protocol
 
 import httpx
@@ -19,6 +18,7 @@ from mobile_agent.agent.mobile.koophone_auth import (
     JksJwtProvider,
     KooPhoneAuthenticator,
 )
+from mobile_agent.agent.mobile.koophone_tls import build_tls_verification
 from mobile_agent.agent.mobile.result import ActionResult
 from mobile_agent.agent.provider import (
     ProviderConfigurationError,
@@ -74,17 +74,12 @@ class StreamableHttpKooPhoneTransport:
         timeout: httpx.Timeout | None = None,
         auth: httpx.Auth | None = None,
     ) -> httpx.AsyncClient:
-        verify: bool | ssl.SSLContext = self._config.tls_verify
-        if self._config.ca_bundle_path is not None:
-            verify = ssl.create_default_context(
-                cafile=str(self._config.ca_bundle_path)
-            )
         return httpx.AsyncClient(
             headers=headers,
             timeout=timeout or httpx.Timeout(30.0),
             auth=auth,
             follow_redirects=True,
-            verify=verify,
+            verify=build_tls_verification(self._config),
         )
 
     async def connect(self, headers: dict[str, str]) -> set[str]:

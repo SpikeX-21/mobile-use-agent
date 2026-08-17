@@ -6,9 +6,11 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import ssl
 import tempfile
 import traceback
 import unittest
+from unittest.mock import patch
 
 import httpx
 import jks
@@ -136,6 +138,43 @@ class KooPhoneIamTests(unittest.IsolatedAsyncioTestCase):
             traceback.format_exception(raised.exception)
         )
         self.assertNotIn("iam-secret-value", rendered_traceback)
+
+    async def test_iam_client_uses_the_configured_custom_ca_policy(self):
+        captured = {}
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, *args, **kwargs):
+                return httpx.Response(
+                    201,
+                    headers={"X-Subject-Token": "iam-token-value"},
+                    json={"token": {"expires_at": "2030-01-02T03:04:05Z"}},
+                )
+
+        def client_factory(**kwargs):
+            captured.update(kwargs)
+            return FakeClient()
+
+        with tempfile.NamedTemporaryFile() as ca_file:
+            config = koophone_config(
+                tls_verify=True,
+                ca_bundle_path=Path(ca_file.name),
+            )
+            with patch(
+                "mobile_agent.agent.mobile.koophone_tls.ssl.create_default_context",
+                return_value=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT),
+            ) as create_context:
+                await HuaweiIamTokenProvider(
+                    config, client_factory=client_factory
+                ).fetch_token()
+
+        create_context.assert_called_once_with(cafile=ca_file.name)
+        self.assertIsInstance(captured["verify"], ssl.SSLContext)
 
 
 class KooPhoneJwtTests(unittest.TestCase):

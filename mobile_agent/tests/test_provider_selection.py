@@ -12,6 +12,8 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -23,7 +25,8 @@ from mobile_agent.agent.llm.provider import (
 from mobile_agent.agent.provider import ProviderConfigurationError, ProviderNotImplementedError
 from mobile_agent.agent.mobile.backend import McpDeviceBackend, create_device_backend
 from mobile_agent.agent.mobile.koophone import KooPhoneDeviceBackend
-from mobile_agent.config.settings import AdbConfig, KimiConfig, Settings
+from mobile_agent.config.settings import AdbConfig, KimiConfig, KooPhoneConfig, Settings
+from pydantic import ValidationError
 from tests.test_koophone_auth import koophone_config
 
 
@@ -95,6 +98,54 @@ class ProviderSelectionTests(unittest.TestCase):
             "KOOPHONE_TLS_VERIFY=false.*ENV=poc",
         ):
             settings.get_koophone_config()
+
+    def test_koophone_config_cannot_bypass_tls_gate_when_built_directly(self):
+        with self.assertRaisesRegex(ValidationError, "ENV=poc"):
+            koophone_config(environment="production", tls_verify=False)
+
+    def test_file_configuration_cannot_supply_koophone_secrets(self):
+        settings = Settings(
+            koophone_iam_password="env-iam-secret",
+            koophone_jks_store_password="env-store-secret",
+            koophone_jks_key_password="env-key-secret",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(
+                '{"koophone_iam_password":"file-iam-secret",'
+                '"koophone_jks_store_password":"file-store-secret",'
+                '"koophone_jks_key_password":"file-key-secret"}',
+                encoding="utf-8",
+            )
+            settings.load_from_file(str(path))
+
+        self.assertEqual(
+            settings.koophone_iam_password.get_secret_value(), "env-iam-secret"
+        )
+        self.assertEqual(
+            settings.koophone_jks_store_password.get_secret_value(),
+            "env-store-secret",
+        )
+        self.assertEqual(
+            settings.koophone_jks_key_password.get_secret_value(), "env-key-secret"
+        )
+
+    def test_file_string_false_cannot_disable_tls_in_production(self):
+        settings = Settings(env="production")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(
+                '{"koophone_tls_verify":"false"}', encoding="utf-8"
+            )
+            settings.load_from_file(str(path))
+
+        values = koophone_config().model_dump()
+        values.update(
+            environment=settings.env,
+            tls_verify=settings.koophone_tls_verify,
+        )
+        with self.assertRaisesRegex(ValidationError, "ENV=poc"):
+            KooPhoneConfig(**values)
 
     def test_defaults_preserve_the_doubao_mcp_runtime(self):
         with patch.dict(os.environ, {}, clear=True):

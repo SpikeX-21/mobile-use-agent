@@ -15,7 +15,14 @@ import re
 import tomli
 from pathlib import Path
 from typing import Dict, Literal, Optional
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    ValidationError,
+    model_validator,
+)
 from pydantic_settings import BaseSettings
 import logging
 from dotenv import load_dotenv
@@ -33,6 +40,14 @@ logger = logging.getLogger(__name__)
 ROOT_DIR = Path(__file__).parent.parent.parent
 
 MOBILE_USE_MCP_NAME = "mobile"
+
+FILE_CONFIG_FORBIDDEN_SECRET_FIELDS = frozenset(
+    {
+        "koophone_iam_password",
+        "koophone_jks_store_password",
+        "koophone_jks_key_password",
+    }
+)
 
 
 class ServerConfig(BaseModel):
@@ -88,6 +103,12 @@ class KooPhoneConfig(BaseModel):
     jks_key_password: SecretStr
     jks_alias: str = Field(default="koophone", min_length=1)
     jwt_ttl_minutes: int = Field(default=1440, ge=1, le=1440)
+
+    @model_validator(mode="after")
+    def enforce_tls_policy(self) -> "KooPhoneConfig":
+        if not self.tls_verify and self.environment.strip().lower() != "poc":
+            raise ValueError("TLS verification may be disabled only when ENV=poc")
+        return self
 
 
 class MCPConfig(BaseModel):
@@ -378,6 +399,20 @@ class Settings(BaseSettings):
                 return self
 
                 # 新增：替换环境变量
+            forbidden_keys = FILE_CONFIG_FORBIDDEN_SECRET_FIELDS.intersection(
+                config_data
+            )
+            if forbidden_keys:
+                logger.warning(
+                    "Ignored environment-only secret fields in file configuration: %s",
+                    ", ".join(sorted(forbidden_keys)),
+                )
+                config_data = {
+                    key: value
+                    for key, value in config_data.items()
+                    if key not in FILE_CONFIG_FORBIDDEN_SECRET_FIELDS
+                }
+
             config_data = self._replace_env_vars(config_data)
 
             # 更新配置（此处不变）

@@ -6,7 +6,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Protocol
+from typing import Any, Callable, Protocol
 
 import httpx
 import jks
@@ -15,6 +15,7 @@ from cryptography.hazmat.primitives import serialization
 from pydantic import SecretStr
 
 from mobile_agent.agent.provider import ProviderConfigurationError
+from mobile_agent.agent.mobile.koophone_tls import build_tls_verification
 from mobile_agent.config.settings import KooPhoneConfig
 
 
@@ -32,9 +33,11 @@ class HuaweiIamTokenProvider:
         config: KooPhoneConfig,
         *,
         client: httpx.AsyncClient | None = None,
+        client_factory: Callable[..., Any] | None = None,
     ) -> None:
         self._config = config
         self._client = client
+        self._client_factory = client_factory or httpx.AsyncClient
 
     async def fetch_token(self) -> ExpiringSecret:
         payload = {
@@ -61,7 +64,10 @@ class HuaweiIamTokenProvider:
                     headers={"Content-Type": "application/json"},
                 )
             else:
-                async with httpx.AsyncClient(timeout=30.0) as client:
+                async with self._client_factory(
+                    timeout=30.0,
+                    verify=build_tls_verification(self._config),
+                ) as client:
                     response = await client.post(
                         self._config.iam_auth_url,
                         json=payload,
