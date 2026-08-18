@@ -12,6 +12,7 @@ from typing import Any, Awaitable, Callable, Protocol, TypeVar
 import httpx
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
+from pydantic import ValidationError
 
 from mobile_agent.agent.actions import (
     BackAction,
@@ -331,6 +332,11 @@ class KooPhoneDeviceBackend:
         except KooPhoneOperationOutcomeUncertain:
             return ActionResult.ambiguous(
                 f"KooPhone {action.type} outcome is uncertain after authentication rejection",
+                DeviceErrorKind.COMMAND_FAILED,
+            )
+        except ValidationError:
+            return ActionResult.ambiguous(
+                f"KooPhone {action.type} outcome is uncertain after malformed MCP receipt",
                 DeviceErrorKind.COMMAND_FAILED,
             )
         except Exception as error:

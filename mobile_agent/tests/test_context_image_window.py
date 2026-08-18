@@ -7,6 +7,19 @@ from mobile_agent.agent.memory.context_manager import ContextManager
 
 
 class ContextImageWindowTests(unittest.TestCase):
+    def test_initial_screenshot_includes_resolution_and_high_detail(self):
+        manager = ContextManager(messages=[])
+
+        manager.add_user_initial_message(
+            message="启用九点闹钟",
+            screenshot_url="data:image/png;base64,image",
+            screenshot_dimensions=(304, 540),
+        )
+
+        content = manager.get_messages()[0].content
+        self.assertEqual(content[0]["image_url"]["detail"], "high")
+        self.assertIn("304x540", content[1]["text"])
+
     def test_keeps_exactly_the_last_five_screenshots(self):
         manager = ContextManager(messages=[])
         for index in range(7):

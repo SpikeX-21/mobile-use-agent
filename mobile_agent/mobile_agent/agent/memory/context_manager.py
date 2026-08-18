@@ -41,9 +41,20 @@ class ContextManager:
         else:
             self._messages.insert(0, system_message)
 
-    def add_user_initial_message(self, message: str, screenshot_url: str):
+    def add_user_initial_message(
+        self,
+        message: str,
+        screenshot_url: str,
+        screenshot_dimensions: tuple[int, int] | None = None,
+    ):
         """初始消息"""
         user_content = f"当前时间点 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ，用户任务: {message}\n请帮我完成任务"
+        if screenshot_dimensions is not None:
+            user_content += (
+                "\n当前截图分辨率为 "
+                f"{screenshot_dimensions[0]}x{screenshot_dimensions[1]}；"
+                "动作坐标必须按整张截图宽高归一化到 0..1000。"
+            )
         self._append(
             ContextManager.get_snapshot_user_prompt(
                 url=screenshot_url, user_content=user_content
@@ -119,7 +130,7 @@ class ContextManager:
     def get_snapshot_user_prompt(url: str, user_content: str) -> HumanMessage:
         # 添加截图消息
         snap_content = ChatCompletionContentPartImageParam(
-            image_url=ImageURL(url=url), type="image_url"
+            image_url=ImageURL(url=url, detail="high"), type="image_url"
         )
         #  UserPrompt
         user_message = ChatCompletionContentPartTextParam(

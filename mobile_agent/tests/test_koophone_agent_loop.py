@@ -21,11 +21,14 @@ from mobile_agent.config.settings import KimiConfig
 from tests.test_koophone_auth import koophone_config
 
 
-def screenshot_response() -> SimpleNamespace:
+def screenshot_base64(color: str = "white") -> str:
     output = io.BytesIO()
-    Image.new("RGB", (90, 60), "white").save(output, format="PNG")
-    encoded = base64.b64encode(output.getvalue()).decode("ascii")
-    return SimpleNamespace(content=[SimpleNamespace(text=encoded)])
+    Image.new("RGB", (90, 60), color).save(output, format="PNG")
+    return base64.b64encode(output.getvalue()).decode("ascii")
+
+
+def screenshot_response(color: str = "white") -> SimpleNamespace:
+    return SimpleNamespace(content=[SimpleNamespace(text=screenshot_base64(color))])
 
 
 class StaticAuthenticator:
@@ -37,8 +40,10 @@ class StaticAuthenticator:
 
 
 class KooPhoneLoopTransport:
-    def __init__(self):
+    def __init__(self, screenshot_colors=None):
         self.tool_calls = []
+        self.screenshot_colors = list(screenshot_colors or ["white"])
+        self.screenshot_index = 0
 
     async def connect(self, headers):
         return set(KOOPHONE_REQUIRED_TOOLS)
@@ -49,7 +54,11 @@ class KooPhoneLoopTransport:
     async def call_tool(self, name, arguments):
         self.tool_calls.append((name, arguments))
         if name == "get_screenshot":
-            return screenshot_response()
+            color = self.screenshot_colors[
+                min(self.screenshot_index, len(self.screenshot_colors) - 1)
+            ]
+            self.screenshot_index += 1
+            return screenshot_response(color)
         return "ok"
 
 
@@ -72,6 +81,34 @@ class KimiCompletions:
                     )
                 )
             ],
+        )
+
+
+class VisualAlarmCompletions:
+    actions_by_image = {
+        screenshot_base64("white"): {"summary": "打开闹钟", "action": {"type": "launch_app", "package_name": "com.android.deskclock"}},
+        screenshot_base64("green"): {"summary": "09:00 已启用", "action": {"type": "finish", "summary": "09:00 已启用"}},
+        screenshot_base64("red"): {"summary": "启用已有闹钟", "action": {"type": "tap", "x": 888, "y": 711}},
+        screenshot_base64("blue"): {"summary": "新建闹钟", "action": {"type": "tap", "x": 900, "y": 900}},
+        screenshot_base64("yellow"): {"summary": "设置九点", "action": {"type": "tap", "x": 500, "y": 500}},
+        screenshot_base64("purple"): {"summary": "保存默认配置", "action": {"type": "tap", "x": 800, "y": 900}},
+    }
+
+    def __init__(self):
+        self.requests = []
+
+    async def create(self, **request):
+        self.requests.append(request)
+        latest_image = next(
+            part["image_url"]["url"].split(",", 1)[1]
+            for message in reversed(request["messages"])
+            for part in message.get("content", [])
+            if isinstance(part, dict) and part.get("type") == "image_url"
+        )
+        response = self.actions_by_image[latest_image]
+        return SimpleNamespace(
+            id=f"alarm-{len(self.requests)}",
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(response, ensure_ascii=False)))],
         )
 
 
@@ -138,22 +175,9 @@ class KooPhoneAgentLoopTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_simulated_alarm_states_follow_idempotent_action_paths(self):
         cases = {
-            "enabled": [
-                {"summary": "打开闹钟", "action": {"type": "launch_app", "package_name": "com.android.deskclock"}},
-                {"summary": "09:00 已启用", "action": {"type": "finish", "summary": "09:00 已启用"}},
-            ],
-            "disabled": [
-                {"summary": "打开闹钟", "action": {"type": "launch_app", "package_name": "com.android.deskclock"}},
-                {"summary": "启用已有闹钟", "action": {"type": "tap", "x": 900, "y": 500}},
-                {"summary": "确认启用", "action": {"type": "finish", "summary": "09:00 已启用"}},
-            ],
-            "missing": [
-                {"summary": "打开闹钟", "action": {"type": "launch_app", "package_name": "com.android.deskclock"}},
-                {"summary": "新建闹钟", "action": {"type": "tap", "x": 900, "y": 900}},
-                {"summary": "设置九点", "action": {"type": "tap", "x": 500, "y": 500}},
-                {"summary": "保存默认配置", "action": {"type": "tap", "x": 800, "y": 900}},
-                {"summary": "确认新闹钟", "action": {"type": "finish", "summary": "09:00 已启用"}},
-            ],
+            "enabled": ["white", "green"],
+            "disabled": ["white", "red", "green"],
+            "missing": ["white", "blue", "yellow", "purple", "green"],
         }
         expected_tools = {
             "enabled": ["start_app"],
@@ -161,13 +185,13 @@ class KooPhoneAgentLoopTests(unittest.IsolatedAsyncioTestCase):
             "missing": ["start_app", "tap", "tap", "tap"],
         }
 
-        for state, responses in cases.items():
+        for state, screenshot_colors in cases.items():
             with self.subTest(state=state):
-                transport = KooPhoneLoopTransport()
+                transport = KooPhoneLoopTransport(screenshot_colors)
                 backend = KooPhoneDeviceBackend(
                     koophone_config(), authenticator=StaticAuthenticator(), transport=transport
                 )
-                completions = KimiCompletions(responses=list(responses))
+                completions = VisualAlarmCompletions()
                 client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
 
                 def model_factory(name, *, thread_id, is_stream):
@@ -198,6 +222,7 @@ class KooPhoneAgentLoopTests(unittest.IsolatedAsyncioTestCase):
                     pass
 
                 self.assertEqual([name for name, _ in transport.tool_calls if name != "get_screenshot"], expected_tools[state])
+                self.assertEqual(transport.screenshot_index, len(screenshot_colors))
 
 
 if __name__ == "__main__":

@@ -146,7 +146,9 @@ async def model_node(state: MobileUseAgentState) -> MobileUseAgentState:
     # 准备消息
     if iteration_count == 0:
         context_manager.add_user_initial_message(
-            message=state.get("user_prompt"), screenshot_url=state.get("screenshot")
+            message=state.get("user_prompt"),
+            screenshot_url=state.get("screenshot"),
+            screenshot_dimensions=state.get("screenshot_dimensions"),
         )
     else:
         context_manager.add_user_iteration_message(

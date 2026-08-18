@@ -11,7 +11,9 @@ from types import SimpleNamespace
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.types import CallToolResult
 from PIL import Image
+from pydantic import ValidationError
 
 from mobile_agent.agent.actions import (
     ClearTextAction,
@@ -485,6 +487,29 @@ class KooPhoneStartupTests(unittest.IsolatedAsyncioTestCase):
         failure_result = await failure_backend.execute(TapAction(x=1, y=2), (100, 100))
         self.assertEqual(failure_result.status.value, "failed")
         self.assertEqual(failure_result.error_kind.value, "command_failed")
+
+    async def test_malformed_side_effect_receipt_is_ambiguous_and_not_replayed(self):
+        malformed_receipt = None
+        try:
+            CallToolResult.model_validate({"content": [{"type": "text"}]})
+        except ValidationError as error:
+            malformed_receipt = error
+        else:
+            self.fail("fixture must be an invalid MCP CallToolResult")
+        transport = ToolCallingMcpTransport([malformed_receipt])
+        backend = KooPhoneDeviceBackend(
+            koophone_config(), authenticator=StaticAuthenticator(), transport=transport
+        )
+        await backend.initialize()
+
+        result = await backend.execute(TapAction(x=888, y=711), (304, 540))
+
+        self.assertEqual(result.status.value, "ambiguous")
+        self.assertEqual(result.error_kind.value, "command_failed")
+        self.assertEqual(
+            transport.tool_calls,
+            [("tap", {"x": 269, "y": 383, "instanceId": "instance-test-1"})],
+        )
 
     async def test_wait_finish_and_fail_remain_local_without_mcp_dispatch(self):
         transport = ToolCallingMcpTransport([])
