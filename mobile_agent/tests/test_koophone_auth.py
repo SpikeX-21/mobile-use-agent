@@ -23,6 +23,7 @@ from pydantic import SecretStr
 from mobile_agent.agent.mobile.koophone_auth import (
     ExpiringSecret,
     HuaweiIamTokenProvider,
+    JksFileKeyMaterialProvider,
     JksJwtProvider,
     KooPhoneAuthenticator,
 )
@@ -181,6 +182,49 @@ class KooPhoneIamTests(unittest.IsolatedAsyncioTestCase):
 
 
 class KooPhoneJwtTests(unittest.TestCase):
+    def test_jwt_signing_accepts_a_replaceable_key_material_provider(self):
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+        class MountedSecretProvider:
+            def load_private_key(self):
+                return private_key
+
+        now = datetime(2030, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+        result = JksJwtProvider(
+            koophone_config(),
+            key_material_provider=MountedSecretProvider(),
+            clock=lambda: now,
+        ).issue_token()
+
+        claims = jwt.decode(
+            result.value.get_secret_value(),
+            private_key.public_key(),
+            algorithms=["RS256"],
+            options={"verify_exp": False, "verify_iat": False},
+        )
+        self.assertEqual(claims["instanceId"], "instance-test-1")
+
+    def test_file_key_material_provider_redacts_invalid_jks_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "invalid.jks"
+            path.write_bytes(b"private-jks-like-bytes")
+            provider = JksFileKeyMaterialProvider(
+                path=path,
+                store_password=SecretStr("store-secret-value"),
+                key_password=SecretStr("key-secret-value"),
+                alias="koophone",
+            )
+
+            with self.assertRaises(ProviderConfigurationError) as raised:
+                provider.load_private_key()
+
+        message = str(raised.exception)
+        self.assertEqual(
+            message, "Unable to load the configured KooPhone JKS private key"
+        )
+        self.assertNotIn("store-secret-value", message)
+        self.assertNotIn("private-jks-like-bytes", message)
+
     def test_signs_rs256_jwt_with_only_instance_and_time_claims(self):
         private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         private_der = private_key.private_bytes(

@@ -156,6 +156,66 @@ python -m mobile_agent.acceptance \
 
 Kimi + ADB 路径不启动也不调用 Go MCP；Doubao + 火山 MCP 兼容回归单独标识。
 
+### KooPhone secret-bearing 内部 POC 容器
+
+`Dockerfile.koophone-poc` 只打包 Python Agent 和闹钟 CLI，不包含 Web、Go MCP 或
+AgentArts SDK。该镜像会把本机、受 Git 忽略的 `jwt.jks` 复制进镜像，因此它是
+**包含私钥材料的内部临时产物**：不得推送公共镜像仓库、不得用于生产，也不要导出或
+作为普通镜像共享。完成联调后应删除本地镜像。后续可通过同一个
+`KeyMaterialProvider` 接口改用 AgentArts/Kubernetes Secret、只读挂载文件或外部
+密钥服务，无需修改 JWT 签发逻辑。
+
+构建前确保 `mobile_agent/jwt.jks` 存在；`.dockerignore` 采用默认拒绝策略，只允许
+Python 包、锁文件、README 和该 JKS 进入构建上下文，`.env`、日志、实验记录、截图、
+缓存和虚拟环境均不会进入镜像：
+
+```bash
+cd mobile_agent
+test -s jwt.jks
+docker build \
+  --file Dockerfile.koophone-poc \
+  --tag mobile-use-koophone-poc:local-secret-bearing \
+  .
+```
+
+所有密码、API Key、实例标识、端点和 TLS 配置只能在启动时从受 Git 忽略的 `.env`
+注入。容器内 JKS 固定为 `/opt/mobile-agent/secrets/koophone.jks`，所以需要在
+`--env-file` 之后显式覆盖本地 `.env` 中可能存在的宿主机路径。当前内部自签证书联调
+可设置 `ENV=poc` 与 `KOOPHONE_TLS_VERIFY=false`；任何非 POC 环境都会拒绝该组合。
+若改用可信自定义 CA，则设置 `KOOPHONE_TLS_VERIFY=true` 和
+`KOOPHONE_CA_BUNDLE=<容器内 CA 路径>`，并将 CA 只读挂载进容器。
+
+```bash
+docker run --rm \
+  --env-file .env \
+  --env KOOPHONE_JKS_PATH=/opt/mobile-agent/secrets/koophone.jks \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  --cap-drop ALL \
+  --security-opt no-new-privileges \
+  mobile-use-koophone-poc:local-secret-bearing
+```
+
+镜像以 UID/GID `10001:10001` 运行，JKS 权限为 `0400`，实验记录默认写入临时目录
+`/tmp/mobile-agent/experiment-runs.jsonl`。入口会先校验 JKS 权限和必需配置；随后沿用
+现有 `MobileUseAgent.initialize()` 刷新 IAM Token 与 JWT，并执行 MCP initialize 和
+`tools/list` 能力探测。任一步失败都会在调用 Kimi 前以非零状态退出；成功后才运行
+真实的“确保存在已启用 09:00 闹钟”任务。
+
+确认镜像身份和密钥权限：
+
+```bash
+docker run --rm --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  --entrypoint /bin/sh mobile-use-koophone-poc:local-secret-bearing \
+  -c 'id && stat -c "mode=%a uid=%u gid=%g" /opt/mobile-agent/secrets/koophone.jks'
+```
+
+联调完成后删除本地 secret-bearing 镜像：
+
+```bash
+docker image rm mobile-use-koophone-poc:local-secret-bearing
+```
+
 ## 🛠️ 核心组件
 
 通过 Mobile Use MCP 支持的移动设备操作：

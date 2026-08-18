@@ -1,0 +1,45 @@
+# SECRET-BEARING INTERNAL POC IMAGE. NEVER PUBLISH OR USE IN PRODUCTION.
+FROM python:3.11.13-slim-bookworm AS builder
+
+WORKDIR /opt/mobile-agent
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends gcc libc6-dev \
+    && python -m pip install --no-cache-dir uv==0.8.11 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml uv.lock README.md ./
+RUN uv sync --frozen --no-dev --no-install-project
+
+COPY mobile_agent ./mobile_agent
+RUN uv sync --frozen --no-dev --no-editable \
+    && rm -rf /root/.cache /tmp/*
+
+FROM python:3.11.13-slim-bookworm
+
+LABEL org.opencontainers.image.title="mobile-use KooPhone internal POC" \
+      org.opencontainers.image.description="secret-bearing internal POC; never publish or use in production" \
+      com.mobile-use.security.secret-bearing="true"
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/opt/mobile-agent/.venv/bin:${PATH}" \
+    MOBILE_CONFIG_PATH=/opt/mobile-agent/config.toml \
+    KOOPHONE_JKS_PATH=/opt/mobile-agent/secrets/koophone.jks \
+    EXPERIMENT_RECORD_PATH=/tmp/mobile-agent/experiment-runs.jsonl
+
+WORKDIR /opt/mobile-agent
+
+RUN groupadd --gid 10001 mobile-agent \
+    && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent mobile-agent \
+    && install -d -o 10001 -g 10001 -m 0750 /opt/mobile-agent/secrets
+
+COPY --from=builder --chown=10001:10001 /opt/mobile-agent/.venv /opt/mobile-agent/.venv
+COPY --chown=10001:10001 --chmod=0444 config.toml /opt/mobile-agent/config.toml
+
+COPY --chown=10001:10001 --chmod=0400 jwt.jks /opt/mobile-agent/secrets/koophone.jks
+RUN test -s /opt/mobile-agent/secrets/koophone.jks
+
+USER 10001:10001
+
+ENTRYPOINT ["python", "-m", "mobile_agent.koophone_container_cli"]

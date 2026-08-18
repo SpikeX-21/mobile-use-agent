@@ -25,6 +25,46 @@ class ExpiringSecret:
     expires_at: datetime
 
 
+class KeyMaterialProvider(Protocol):
+    """Supply signing key material without exposing where it is stored."""
+
+    def load_private_key(self) -> Any: ...
+
+
+class JksFileKeyMaterialProvider:
+    """Load a KooPhone signing key from a local or mounted JKS file."""
+
+    def __init__(
+        self,
+        *,
+        path: Any,
+        store_password: SecretStr,
+        key_password: SecretStr,
+        alias: str,
+    ) -> None:
+        self._path = path
+        self._store_password = store_password
+        self._key_password = key_password
+        self._alias = alias
+
+    def load_private_key(self) -> Any:
+        try:
+            keystore = jks.KeyStore.load(
+                str(self._path), self._store_password.get_secret_value()
+            )
+            entry = keystore.private_keys[self._alias.lower()]
+            if not entry.is_decrypted():
+                entry.decrypt(self._key_password.get_secret_value())
+            return serialization.load_der_private_key(
+                entry.pkey_pkcs8,
+                password=None,
+            )
+        except Exception:
+            raise ProviderConfigurationError(
+                "Unable to load the configured KooPhone JKS private key"
+            ) from None
+
+
 class HuaweiIamTokenProvider:
     """Fetch a scoped Huawei IAM token without retaining the password payload."""
 
@@ -109,28 +149,20 @@ class JksJwtProvider:
         self,
         config: KooPhoneConfig,
         *,
+        key_material_provider: KeyMaterialProvider | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._config = config
+        self._key_material_provider = key_material_provider or JksFileKeyMaterialProvider(
+            path=config.jks_path,
+            store_password=config.jks_store_password,
+            key_password=config.jks_key_password,
+            alias=config.jks_alias,
+        )
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     def issue_token(self) -> ExpiringSecret:
-        try:
-            keystore = jks.KeyStore.load(
-                str(self._config.jks_path),
-                self._config.jks_store_password.get_secret_value(),
-            )
-            entry = keystore.private_keys[self._config.jks_alias.lower()]
-            if not entry.is_decrypted():
-                entry.decrypt(self._config.jks_key_password.get_secret_value())
-            private_key = serialization.load_der_private_key(
-                entry.pkey_pkcs8,
-                password=None,
-            )
-        except Exception:
-            raise ProviderConfigurationError(
-                "Unable to load the configured KooPhone JKS private key"
-            ) from None
+        private_key = self._key_material_provider.load_private_key()
 
         issued_at = self._clock()
         if issued_at.tzinfo is None:

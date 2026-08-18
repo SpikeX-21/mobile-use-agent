@@ -11,6 +11,7 @@ import sys
 from typing import Callable
 
 from mobile_agent.agent.mobile_use_agent import MobileUseAgent
+from mobile_agent.agent.provider import ProviderConfigurationError
 from mobile_agent.koophone_cli import run_koophone_vision_demo
 
 
@@ -48,7 +49,7 @@ def main() -> None:
     parser.parse_args()
     try:
         chunk_count = asyncio.run(run_koophone_alarm_demo())
-    except RuntimeError as error:
+    except (ProviderConfigurationError, RuntimeError) as error:
         print(f"KOOPHONE_ALARM_DEMO=failed reason={error}", file=sys.stderr)
         raise SystemExit(1) from None
     print(f"KOOPHONE_ALARM_DEMO=finished chunks={chunk_count}")

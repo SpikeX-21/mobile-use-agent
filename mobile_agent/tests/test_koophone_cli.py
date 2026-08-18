@@ -3,10 +3,17 @@
 
 from __future__ import annotations
 
+import io
 import unittest
+from unittest.mock import patch
 
+from mobile_agent.agent.provider import ProviderConfigurationError
 from mobile_agent.koophone_cli import run_koophone_vision_demo
-from mobile_agent.koophone_alarm_cli import ALARM_PROMPT, run_koophone_alarm_demo
+from mobile_agent.koophone_alarm_cli import (
+    ALARM_PROMPT,
+    main as alarm_main,
+    run_koophone_alarm_demo,
+)
 
 
 class RecordingAgent:
@@ -70,6 +77,34 @@ class KooPhoneCliTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("最新截图", created[0].run_prompt)
         self.assertIn("com.android.deskclock", created[0].run_prompt)
         self.assertEqual(created[0].run_prompt, ALARM_PROMPT)
+
+
+class KooPhoneCliMainTests(unittest.TestCase):
+    def test_authentication_probe_failure_exits_cleanly_before_llm_work(self):
+        def fail_authentication(coroutine):
+            coroutine.close()
+            raise ProviderConfigurationError(
+                "KooPhone startup authentication failed"
+            )
+
+        stderr = io.StringIO()
+        with (
+            patch("sys.argv", ["koophone-alarm"]),
+            patch(
+                "mobile_agent.koophone_alarm_cli.asyncio.run",
+                side_effect=fail_authentication,
+            ),
+            patch("sys.stderr", stderr),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            alarm_main()
+
+        self.assertEqual(raised.exception.code, 1)
+        self.assertEqual(
+            stderr.getvalue(),
+            "KOOPHONE_ALARM_DEMO=failed reason="
+            "KooPhone startup authentication failed\n",
+        )
 
 
 if __name__ == "__main__":
