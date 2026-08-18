@@ -176,6 +176,7 @@ class KooPhoneDeviceBackend:
         )
         self._transport = transport or StreamableHttpKooPhoneTransport(config)
         self._session_headers: dict[str, str] | None = None
+        self._blocked_side_effect_signatures: set[str] = set()
 
     async def initialize(self, **connection: str) -> None:
         del connection
@@ -279,7 +280,17 @@ class KooPhoneDeviceBackend:
                 response = await self._call_tool(
                     "get_screenshot", {}, retry_safe=True
                 )
-                return normalize_koophone_screenshot(response)
+                observation = normalize_koophone_screenshot(response)
+                expected_dimensions = (
+                    self._config.input_width,
+                    self._config.input_height,
+                )
+                if observation["screenshot_dimensions"] != expected_dimensions:
+                    raise DeviceBackendError(
+                        "KooPhone screenshot dimensions do not match the configured input space",
+                        kind=DeviceErrorKind.INVALID_OBSERVATION,
+                    )
+                return observation
             except DeviceBackendError as error:
                 final_error = error
             except Exception as error:
@@ -292,6 +303,7 @@ class KooPhoneDeviceBackend:
 
     async def prepare_task(self, user_prompt: str) -> None:
         del user_prompt
+        self._blocked_side_effect_signatures.clear()
 
     async def execute(
         self,
@@ -324,28 +336,51 @@ class KooPhoneDeviceBackend:
                 "KooPhone action execution is delivered by Issue #15"
             )
         tool_call = self.to_tool_call(action, screenshot_dimensions)
+        is_side_effect = not isinstance(action, ListAppsAction)
+        action_signature = action.model_dump_json() if is_side_effect else None
+        if action_signature in self._blocked_side_effect_signatures:
+            return ActionResult.rejected(
+                f"KooPhone {action.type} duplicate retry blocked after an uncertain or failed receipt",
+                DeviceErrorKind.COMMAND_FAILED,
+            )
         try:
             response = await self._call_tool(
-                tool_call["name"], tool_call["arguments"] or {}, retry_safe=False
+                tool_call["name"],
+                tool_call["arguments"] or {},
+                retry_safe=not is_side_effect,
             )
             _ensure_koophone_tool_success(response)
         except KooPhoneOperationOutcomeUncertain:
+            assert action_signature is not None
+            self._blocked_side_effect_signatures.add(action_signature)
             return ActionResult.ambiguous(
                 f"KooPhone {action.type} outcome is uncertain after authentication rejection",
                 DeviceErrorKind.COMMAND_FAILED,
             )
         except ValidationError:
+            if not is_side_effect:
+                return ActionResult.failed(
+                    f"KooPhone {action.type} returned a malformed receipt",
+                    DeviceErrorKind.COMMAND_FAILED,
+                )
+            assert action_signature is not None
+            self._blocked_side_effect_signatures.add(action_signature)
             return ActionResult.ambiguous(
                 f"KooPhone {action.type} outcome is uncertain after malformed MCP receipt",
                 DeviceErrorKind.COMMAND_FAILED,
             )
         except Exception as error:
             error_kind = classify_device_error(error)
-            if error_kind is DeviceErrorKind.TIMEOUT:
+            if error_kind is DeviceErrorKind.TIMEOUT and is_side_effect:
+                assert action_signature is not None
+                self._blocked_side_effect_signatures.add(action_signature)
                 return ActionResult.ambiguous(
                     f"KooPhone {action.type} result is unknown after timeout",
                     error_kind,
                 )
+            if is_side_effect:
+                assert action_signature is not None
+                self._blocked_side_effect_signatures.add(action_signature)
             return ActionResult.failed(f"KooPhone {action.type} failed", error_kind)
         if isinstance(action, ListAppsAction):
             return ActionResult.success(_list_apps_result_message(response))
@@ -357,23 +392,23 @@ class KooPhoneDeviceBackend:
         screenshot_dimensions: tuple[int, int],
     ) -> ToolCall:
         if isinstance(action, TapAction):
-            width, height = screenshot_dimensions
+            del screenshot_dimensions
             return {
                 "name": "tap",
                 "arguments": {
-                    "x": _to_pixel(action.x, width),
-                    "y": _to_pixel(action.y, height),
+                    "x": _to_pixel(action.x, self._config.input_width),
+                    "y": _to_pixel(action.y, self._config.input_height),
                 },
             }
         if isinstance(action, SwipeAction):
-            width, height = screenshot_dimensions
+            del screenshot_dimensions
             return {
                 "name": "swipe",
                 "arguments": {
-                    "startX": _to_pixel(action.start_x, width),
-                    "startY": _to_pixel(action.start_y, height),
-                    "endX": _to_pixel(action.end_x, width),
-                    "endY": _to_pixel(action.end_y, height),
+                    "startX": _to_pixel(action.start_x, self._config.input_width),
+                    "startY": _to_pixel(action.start_y, self._config.input_height),
+                    "endX": _to_pixel(action.end_x, self._config.input_width),
+                    "endY": _to_pixel(action.end_y, self._config.input_height),
                     "durationMs": action.duration_ms,
                 },
             }

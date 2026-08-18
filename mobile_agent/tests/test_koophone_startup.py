@@ -34,13 +34,16 @@ from mobile_agent.agent.mobile.koophone import (
     KooPhoneOperationOutcomeUncertain,
     StreamableHttpKooPhoneTransport,
 )
+from mobile_agent.agent.mobile.result import DeviceBackendError, DeviceErrorKind
 from mobile_agent.agent.provider import ProviderConfigurationError
 from tests.test_koophone_auth import koophone_config
 
 
-def screenshot_base64(width: int = 80, height: int = 60) -> str:
+def screenshot_base64(
+    width: int = 80, height: int = 60, color: str = "white"
+) -> str:
     output = io.BytesIO()
-    Image.new("RGB", (width, height), "white").save(output, format="PNG")
+    Image.new("RGB", (width, height), color).save(output, format="PNG")
     return base64.b64encode(output.getvalue()).decode("ascii")
 
 
@@ -352,7 +355,9 @@ class KooPhoneStartupTests(unittest.IsolatedAsyncioTestCase):
             [SimpleNamespace(content=[SimpleNamespace(text=encoded)])]
         )
         backend = KooPhoneDeviceBackend(
-            koophone_config(), authenticator=StaticAuthenticator(), transport=transport
+            koophone_config(input_width=80, input_height=60),
+            authenticator=StaticAuthenticator(),
+            transport=transport,
         )
         await backend.initialize()
 
@@ -365,10 +370,30 @@ class KooPhoneStartupTests(unittest.IsolatedAsyncioTestCase):
             [("get_screenshot", {"instanceId": "instance-test-1"})],
         )
 
+    async def test_screenshot_rejects_a_coordinate_space_mismatch(self):
+        encoded = screenshot_base64(width=304, height=540)
+        responses = [
+            SimpleNamespace(content=[SimpleNamespace(text=encoded)]),
+            SimpleNamespace(content=[SimpleNamespace(text=encoded)]),
+        ]
+        backend = KooPhoneDeviceBackend(
+            koophone_config(input_width=1080, input_height=1920),
+            authenticator=StaticAuthenticator(),
+            transport=ToolCallingMcpTransport(responses),
+        )
+        await backend.initialize()
+
+        with self.assertRaises(DeviceBackendError) as raised:
+            await backend.take_screenshot()
+
+        self.assertEqual(raised.exception.kind, DeviceErrorKind.INVALID_OBSERVATION)
+
     async def test_tap_and_home_are_mapped_without_exposing_instance_id_to_agent(self):
         transport = ToolCallingMcpTransport(["tap ok", "home ok"])
         backend = KooPhoneDeviceBackend(
-            koophone_config(), authenticator=StaticAuthenticator(), transport=transport
+            koophone_config(),
+            authenticator=StaticAuthenticator(),
+            transport=transport,
         )
         await backend.initialize()
 
@@ -376,12 +401,12 @@ class KooPhoneStartupTests(unittest.IsolatedAsyncioTestCase):
         await backend.execute(TapAction(x=1000, y=500), (80, 60))
         await backend.execute(HomeAction(), (80, 60))
 
-        self.assertEqual(tap_call, {"name": "tap", "arguments": {"x": 79, "y": 30}})
+        self.assertEqual(tap_call, {"name": "tap", "arguments": {"x": 1079, "y": 960}})
         self.assertNotIn("instanceId", tap_call["arguments"])
         self.assertEqual(
             transport.tool_calls,
             [
-                ("tap", {"instanceId": "instance-test-1", "x": 79, "y": 30}),
+                ("tap", {"instanceId": "instance-test-1", "x": 1079, "y": 960}),
                 ("send_key", {"instanceId": "instance-test-1", "key": "HOME"}),
             ],
         )
@@ -408,8 +433,8 @@ class KooPhoneStartupTests(unittest.IsolatedAsyncioTestCase):
         )
 
         calls = [
-            (TapAction(x=500, y=500), (100, 200), {"name": "tap", "arguments": {"x": 50, "y": 100}}),
-            (SwipeAction(start_x=0, start_y=1000, end_x=500, end_y=0, duration_ms=450), (100, 200), {"name": "swipe", "arguments": {"startX": 0, "startY": 199, "endX": 50, "endY": 0, "durationMs": 450}}),
+            (TapAction(x=500, y=500), (100, 200), {"name": "tap", "arguments": {"x": 540, "y": 960}}),
+            (SwipeAction(start_x=0, start_y=1000, end_x=500, end_y=0, duration_ms=450), (100, 200), {"name": "swipe", "arguments": {"startX": 0, "startY": 1919, "endX": 540, "endY": 0, "durationMs": 450}}),
             (TextInputAction(text="hello"), (100, 200), {"name": "input_text", "arguments": {"text": "hello"}}),
             (ClearTextAction(), (100, 200), {"name": "clear_text", "arguments": {}}),
             (LaunchAppAction(package_name="com.example.app"), (100, 200), {"name": "start_app", "arguments": {"packageName": "com.example.app"}}),
@@ -443,8 +468,8 @@ class KooPhoneStartupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             transport.tool_calls,
             [
-                ("tap", {"x": 50, "y": 100, "instanceId": "instance-test-1"}),
-                ("swipe", {"startX": 0, "startY": 199, "endX": 50, "endY": 0, "durationMs": 300, "instanceId": "instance-test-1"}),
+                ("tap", {"x": 540, "y": 960, "instanceId": "instance-test-1"}),
+                ("swipe", {"startX": 0, "startY": 1919, "endX": 540, "endY": 0, "durationMs": 300, "instanceId": "instance-test-1"}),
                 ("input_text", {"text": "hello", "instanceId": "instance-test-1"}),
                 ("clear_text", {"instanceId": "instance-test-1"}),
                 ("start_app", {"packageName": "com.example.app", "instanceId": "instance-test-1"}),
@@ -508,7 +533,94 @@ class KooPhoneStartupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.error_kind.value, "command_failed")
         self.assertEqual(
             transport.tool_calls,
-            [("tap", {"x": 269, "y": 383, "instanceId": "instance-test-1"})],
+            [("tap", {"x": 959, "y": 1365, "instanceId": "instance-test-1"})],
+        )
+
+    async def test_same_uncertain_action_is_blocked_even_when_dynamic_screenshot_changes(self):
+        encoded = screenshot_base64()
+        changed = screenshot_base64(width=80, height=60, color="black")
+        transport = ToolCallingMcpTransport(
+            [
+                SimpleNamespace(content=[SimpleNamespace(text=changed)]),
+                TimeoutError("tap timed out"),
+                SimpleNamespace(content=[SimpleNamespace(text=encoded)]),
+            ]
+        )
+        backend = KooPhoneDeviceBackend(
+            koophone_config(input_width=80, input_height=60),
+            authenticator=StaticAuthenticator(),
+            transport=transport,
+        )
+        await backend.initialize()
+        action = TapAction(x=888, y=711)
+
+        await backend.take_screenshot()
+        first = await backend.execute(action, (304, 540))
+        await backend.take_screenshot()
+        repeated = await backend.execute(action, (304, 540))
+
+        self.assertEqual(first.status.value, "ambiguous")
+        self.assertEqual(repeated.status.value, "rejected")
+        self.assertEqual(
+            [name for name, _ in transport.tool_calls],
+            ["get_screenshot", "tap", "get_screenshot"],
+        )
+
+    async def test_list_apps_auth_recovery_is_retry_safe_and_not_blocked(self):
+        authenticator = RotatingAuthenticator()
+        transport = ToolCallingMcpTransport(
+            [authentication_error(401), SimpleNamespace(content=[])]
+        )
+        backend = KooPhoneDeviceBackend(
+            koophone_config(), authenticator=authenticator, transport=transport
+        )
+        await backend.initialize()
+
+        result = await backend.execute(ListAppsAction(), (1080, 1920))
+
+        self.assertEqual(result.status.value, "success")
+        self.assertEqual(authenticator.invalidations, 1)
+        self.assertEqual(
+            [name for name, _ in transport.tool_calls],
+            ["get_installed_apps", "get_installed_apps"],
+        )
+
+    async def test_list_apps_does_not_clear_an_uncertain_tap_block(self):
+        transport = ToolCallingMcpTransport(
+            [TimeoutError("tap outcome unknown"), SimpleNamespace(content=[])]
+        )
+        backend = KooPhoneDeviceBackend(
+            koophone_config(), authenticator=StaticAuthenticator(), transport=transport
+        )
+        await backend.initialize()
+        tap = TapAction(x=888, y=711)
+
+        first_tap = await backend.execute(tap, (1080, 1920))
+        list_apps = await backend.execute(ListAppsAction(), (1080, 1920))
+        repeated_tap = await backend.execute(tap, (1080, 1920))
+
+        self.assertEqual(first_tap.status.value, "ambiguous")
+        self.assertEqual(list_apps.status.value, "success")
+        self.assertEqual(repeated_tap.status.value, "rejected")
+        self.assertEqual(
+            [name for name, _ in transport.tool_calls],
+            ["tap", "get_installed_apps"],
+        )
+
+    def test_tap_uses_configured_device_input_space_not_downscaled_screenshot(self):
+        backend = KooPhoneDeviceBackend(
+            koophone_config(input_width=1080, input_height=1920),
+            authenticator=StaticAuthenticator(),
+            transport=ToolCallingMcpTransport([]),
+        )
+
+        tool_call = backend.to_tool_call(
+            TapAction(x=888, y=711), screenshot_dimensions=(304, 540)
+        )
+
+        self.assertEqual(
+            tool_call,
+            {"name": "tap", "arguments": {"x": 959, "y": 1365}},
         )
 
     async def test_wait_finish_and_fail_remain_local_without_mcp_dispatch(self):

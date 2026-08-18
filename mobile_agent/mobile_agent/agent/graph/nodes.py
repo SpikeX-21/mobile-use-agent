@@ -528,6 +528,13 @@ async def tool_node(state: MobileUseAgentState) -> MobileUseAgentState:
         _set_terminal_failure(
             state, f"设备离线：{action_result.message}", device_backend
         )
+    elif action_result.status is ActionResultStatus.REJECTED:
+        terminal_reason = "unsafe_retry_blocked"
+        _set_terminal_failure(
+            state,
+            f"已阻止失败或不确定回执后的同一副作用动作重放：{action_result.message}",
+            device_backend,
+        )
     elif state.get("iteration_count", 0) >= state.get("max_iterations", 10):
         terminal_reason = "step_limit"
         _set_terminal_failure(

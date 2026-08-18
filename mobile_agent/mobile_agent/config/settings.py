@@ -91,6 +91,8 @@ class KooPhoneConfig(BaseModel):
     environment: str = Field(min_length=1)
     mcp_url: str = Field(min_length=1)
     instance_id: str = Field(min_length=1)
+    input_width: int = Field(ge=1)
+    input_height: int = Field(ge=1)
     tls_verify: bool = True
     ca_bundle_path: Path | None = None
     iam_auth_url: str = Field(min_length=1)
@@ -189,6 +191,20 @@ class Settings(BaseSettings):
     )
     koophone_instance_id: str | None = Field(
         default_factory=lambda: os.environ.get("KOOPHONE_INSTANCE_ID")
+    )
+    koophone_input_width: int | None = Field(
+        default_factory=lambda: (
+            int(os.environ["KOOPHONE_INPUT_WIDTH"])
+            if os.environ.get("KOOPHONE_INPUT_WIDTH")
+            else None
+        )
+    )
+    koophone_input_height: int | None = Field(
+        default_factory=lambda: (
+            int(os.environ["KOOPHONE_INPUT_HEIGHT"])
+            if os.environ.get("KOOPHONE_INPUT_HEIGHT")
+            else None
+        )
     )
     koophone_tls_verify: bool = Field(
         default_factory=lambda: os.environ.get("KOOPHONE_TLS_VERIFY", "true")
@@ -298,6 +314,8 @@ class Settings(BaseSettings):
         required = {
             "KOOPHONE_MCP_URL": self.koophone_mcp_url,
             "KOOPHONE_INSTANCE_ID": self.koophone_instance_id,
+            "KOOPHONE_INPUT_WIDTH": self.koophone_input_width,
+            "KOOPHONE_INPUT_HEIGHT": self.koophone_input_height,
             "KOOPHONE_IAM_AUTH_URL": self.koophone_iam_auth_url,
             "KOOPHONE_IAM_DOMAIN": self.koophone_iam_domain,
             "KOOPHONE_IAM_USERNAME": self.koophone_iam_username,
@@ -327,6 +345,8 @@ class Settings(BaseSettings):
                 environment=self.env,
                 mcp_url=self.koophone_mcp_url,
                 instance_id=self.koophone_instance_id,
+                input_width=self.koophone_input_width,
+                input_height=self.koophone_input_height,
                 tls_verify=self.koophone_tls_verify,
                 ca_bundle_path=(
                     Path(self.koophone_ca_bundle_path)

@@ -61,6 +61,11 @@ class KimiModelProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("latest screenshot", KimiModelProvider.prompt)
         self.assertIn("do not blindly repeat", KimiModelProvider.prompt)
 
+    def test_prompt_requires_center_based_coordinate_calibration(self):
+        self.assertIn("visual center", KimiModelProvider.prompt)
+        self.assertIn("pixel center", KimiModelProvider.prompt)
+        self.assertIn("divide by the full screenshot", KimiModelProvider.prompt)
+
     def test_prompt_allows_complete_adb_action_vocabulary(self):
         self.assertIn('"type":"text_input"', KimiModelProvider.prompt)
         self.assertIn('"type":"clear_text"', KimiModelProvider.prompt)

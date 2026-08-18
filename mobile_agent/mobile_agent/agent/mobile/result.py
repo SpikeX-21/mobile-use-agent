@@ -14,6 +14,7 @@ class ActionResultStatus(str, Enum):
     SUCCESS = "success"
     FAILED = "failed"
     AMBIGUOUS = "ambiguous"
+    REJECTED = "rejected"
 
 
 class DeviceErrorKind(str, Enum):
@@ -95,6 +96,16 @@ class ActionResult:
     ) -> "ActionResult":
         return cls(
             status=ActionResultStatus.AMBIGUOUS,
+            message=message,
+            error_kind=error_kind,
+        )
+
+    @classmethod
+    def rejected(
+        cls, message: str, error_kind: DeviceErrorKind
+    ) -> "ActionResult":
+        return cls(
+            status=ActionResultStatus.REJECTED,
             message=message,
             error_kind=error_kind,
         )

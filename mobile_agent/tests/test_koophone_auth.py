@@ -35,6 +35,8 @@ def koophone_config(**overrides) -> KooPhoneConfig:
         "environment": "poc",
         "mcp_url": "https://mcp.example.test/mcp",
         "instance_id": "instance-test-1",
+        "input_width": 1080,
+        "input_height": 1920,
         "tls_verify": False,
         "iam_auth_url": "https://iam.example.test/v3/auth/tokens",
         "iam_domain": "domain-test",

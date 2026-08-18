@@ -36,6 +36,8 @@ class ProviderSelectionTests(unittest.TestCase):
             "ENV": "poc",
             "KOOPHONE_MCP_URL": "https://mcp.example.test/mcp",
             "KOOPHONE_INSTANCE_ID": "instance-test-1",
+            "KOOPHONE_INPUT_WIDTH": "1080",
+            "KOOPHONE_INPUT_HEIGHT": "1920",
             "KOOPHONE_TLS_VERIFY": "false",
             "KOOPHONE_IAM_AUTH_URL": "https://iam.example.test/v3/auth/tokens",
             "KOOPHONE_IAM_DOMAIN": "domain-test",
@@ -54,6 +56,7 @@ class ProviderSelectionTests(unittest.TestCase):
 
         self.assertEqual(str(config.mcp_url), "https://mcp.example.test/mcp")
         self.assertEqual(config.instance_id, "instance-test-1")
+        self.assertEqual((config.input_width, config.input_height), (1080, 1920))
         self.assertFalse(config.tls_verify)
         self.assertEqual(config.jwt_ttl_minutes, 1440)
         self.assertNotIn("iam-secret-value", repr(config))
@@ -79,6 +82,8 @@ class ProviderSelectionTests(unittest.TestCase):
             "ENV": "production",
             "KOOPHONE_MCP_URL": "https://mcp.example.test/mcp",
             "KOOPHONE_INSTANCE_ID": "instance-test-1",
+            "KOOPHONE_INPUT_WIDTH": "1080",
+            "KOOPHONE_INPUT_HEIGHT": "1920",
             "KOOPHONE_TLS_VERIFY": "false",
             "KOOPHONE_IAM_AUTH_URL": "https://iam.example.test/v3/auth/tokens",
             "KOOPHONE_IAM_DOMAIN": "domain-test",

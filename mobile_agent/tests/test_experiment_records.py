@@ -17,6 +17,7 @@ from pydantic import ValidationError
 from mobile_agent.agent.actions import FinishAction, TapAction, TextInputAction
 from mobile_agent.agent.actions.mcp_adapter import canonical_action_to_mcp_tool_call
 from mobile_agent.agent.experiments.records import (
+    ExperimentRun,
     JsonlExperimentRecorder,
     RunRecord,
     redact_action_arguments,
@@ -128,6 +129,33 @@ class ProviderConstructionError(RuntimeError):
 
 
 class ExperimentRecordTests(unittest.TestCase):
+    def test_terminal_business_outcome_survives_recorder_failure(self):
+        class BrokenRecorder:
+            def write(self, record):
+                raise OSError("disk unavailable")
+
+        run = ExperimentRun(
+            recorder=BrokenRecorder(),
+            query="ensure alarm",
+            provider="kimi",
+            model="kimi-k2.6",
+            device_provider="koophone_mcp",
+        )
+
+        recorded = run.try_record_step(
+            step_number=1,
+            action=FinishAction(summary="09:00 enabled"),
+            model_latency_ms=1,
+            device_latency_ms=None,
+            action_status="success",
+            schema_status="valid",
+            terminal_reason="completed",
+            observation_images_used=1,
+        )
+
+        self.assertFalse(recorded)
+        self.assertEqual(run.terminal_reason, "completed")
+
     @staticmethod
     def make_record(run_id=None):
         return RunRecord(

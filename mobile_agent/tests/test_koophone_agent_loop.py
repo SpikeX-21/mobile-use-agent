@@ -23,7 +23,7 @@ from tests.test_koophone_auth import koophone_config
 
 def screenshot_base64(color: str = "white") -> str:
     output = io.BytesIO()
-    Image.new("RGB", (90, 60), color).save(output, format="PNG")
+    Image.new("RGB", (1080, 1920), color).save(output, format="PNG")
     return base64.b64encode(output.getvalue()).decode("ascii")
 
 
@@ -62,6 +62,47 @@ class KooPhoneLoopTransport:
         return "ok"
 
 
+class AlarmStateTransport:
+    def __init__(self, transitions):
+        self.tool_calls = []
+        self.color = "white"
+        self.transitions = list(transitions)
+        self.screenshot_index = 0
+
+    async def connect(self, headers):
+        return set(KOOPHONE_REQUIRED_TOOLS)
+
+    async def close(self):
+        return None
+
+    async def call_tool(self, name, arguments):
+        self.tool_calls.append((name, arguments))
+        if name == "get_screenshot":
+            self.screenshot_index += 1
+            return screenshot_response(self.color)
+        if self.transitions:
+            expected_name, expected_arguments, next_color = self.transitions[0]
+            if name == expected_name and arguments == expected_arguments:
+                self.transitions.pop(0)
+                self.color = next_color
+        return "ok"
+
+
+class UncertainRepeatTransport(KooPhoneLoopTransport):
+    def __init__(self):
+        super().__init__(["white"])
+        self.tap_count = 0
+
+    async def call_tool(self, name, arguments):
+        if name == "tap":
+            self.tool_calls.append((name, arguments))
+            self.tap_count += 1
+            if self.tap_count > 1:
+                raise AssertionError("duplicate side effect reached MCP")
+            raise TimeoutError("tap outcome unknown")
+        return await super().call_tool(name, arguments)
+
+
 class KimiCompletions:
     def __init__(self, responses=None):
         self.requests = []
@@ -85,13 +126,13 @@ class KimiCompletions:
 
 
 class VisualAlarmCompletions:
-    actions_by_image = {
-        screenshot_base64("white"): {"summary": "打开闹钟", "action": {"type": "launch_app", "package_name": "com.android.deskclock"}},
-        screenshot_base64("green"): {"summary": "09:00 已启用", "action": {"type": "finish", "summary": "09:00 已启用"}},
-        screenshot_base64("red"): {"summary": "启用已有闹钟", "action": {"type": "tap", "x": 888, "y": 711}},
-        screenshot_base64("blue"): {"summary": "新建闹钟", "action": {"type": "tap", "x": 900, "y": 900}},
-        screenshot_base64("yellow"): {"summary": "设置九点", "action": {"type": "tap", "x": 500, "y": 500}},
-        screenshot_base64("purple"): {"summary": "保存默认配置", "action": {"type": "tap", "x": 800, "y": 900}},
+    actions_by_color = {
+        (255, 255, 255): {"summary": "打开闹钟", "action": {"type": "launch_app", "package_name": "com.android.deskclock"}},
+        (0, 128, 0): {"summary": "09:00 已启用", "action": {"type": "finish", "summary": "09:00 已启用"}},
+        (255, 0, 0): {"summary": "启用已有闹钟", "action": {"type": "tap", "x": 888, "y": 711}},
+        (0, 0, 255): {"summary": "新建闹钟", "action": {"type": "tap", "x": 900, "y": 900}},
+        (255, 255, 0): {"summary": "设置九点", "action": {"type": "tap", "x": 500, "y": 500}},
+        (128, 0, 128): {"summary": "保存默认配置", "action": {"type": "tap", "x": 800, "y": 900}},
     }
 
     def __init__(self):
@@ -105,7 +146,12 @@ class VisualAlarmCompletions:
             for part in message.get("content", [])
             if isinstance(part, dict) and part.get("type") == "image_url"
         )
-        response = self.actions_by_image[latest_image]
+        with Image.open(io.BytesIO(base64.b64decode(latest_image))) as screenshot:
+            response = self.actions_by_color[
+                screenshot.convert("RGB").getpixel(
+                    (screenshot.width // 2, screenshot.height // 2)
+                )
+            ]
         return SimpleNamespace(
             id=f"alarm-{len(self.requests)}",
             choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(response, ensure_ascii=False)))],
@@ -113,6 +159,51 @@ class VisualAlarmCompletions:
 
 
 class KooPhoneAgentLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_agent_safely_terminates_before_repeating_uncertain_tap(self):
+        transport = UncertainRepeatTransport()
+        backend = KooPhoneDeviceBackend(
+            koophone_config(), authenticator=StaticAuthenticator(), transport=transport
+        )
+        completions = KimiCompletions(
+            responses=[
+                {"summary": "first", "action": {"type": "tap", "x": 500, "y": 500}},
+                {"summary": "repeat", "action": {"type": "tap", "x": 500, "y": 500}},
+            ]
+        )
+        client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+        def model_factory(name, *, thread_id, is_stream):
+            return KimiModelProvider(
+                thread_id=thread_id,
+                config=KimiConfig(api_key=SecretStr("unit-test-key")),
+                client=client,
+            )
+
+        agent = MobileUseAgent(
+            model_provider_name="kimi",
+            device_provider_name="koophone_mcp",
+            model_provider_factory=model_factory,
+            device_backend_factory=lambda name: backend,
+        )
+        agent.step_interval = 0
+        await agent.initialize("", "", "", "", "", "")
+
+        async for _ in agent.run(
+            "tap once",
+            is_stream=False,
+            task_id="uncertain-repeat",
+            session_id="alarm-test",
+            thread_id=f"uncertain-repeat-{uuid.uuid4()}",
+            sse_connection=asyncio.Event(),
+            phone_width=90,
+            phone_height=60,
+        ):
+            pass
+
+        self.assertEqual(transport.tap_count, 1)
+        self.assertEqual(len(completions.requests), 2)
+        self.assertEqual(agent.last_terminal_reason, "unsafe_retry_blocked")
+
     async def test_real_agent_seam_sends_koophone_screenshot_to_kimi_then_taps(self):
         transport = KooPhoneLoopTransport()
         backend = KooPhoneDeviceBackend(
@@ -166,7 +257,7 @@ class KooPhoneAgentLoopTests(unittest.IsolatedAsyncioTestCase):
             transport.tool_calls,
             [
                 ("get_screenshot", {"instanceId": "instance-test-1"}),
-                ("tap", {"instanceId": "instance-test-1", "x": 45, "y": 30}),
+                ("tap", {"instanceId": "instance-test-1", "x": 540, "y": 960}),
                 ("get_screenshot", {"instanceId": "instance-test-1"}),
             ],
         )
@@ -175,9 +266,19 @@ class KooPhoneAgentLoopTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_simulated_alarm_states_follow_idempotent_action_paths(self):
         cases = {
-            "enabled": ["white", "green"],
-            "disabled": ["white", "red", "green"],
-            "missing": ["white", "blue", "yellow", "purple", "green"],
+            "enabled": [
+                ("start_app", {"packageName": "com.android.deskclock", "instanceId": "instance-test-1"}, "green"),
+            ],
+            "disabled": [
+                ("start_app", {"packageName": "com.android.deskclock", "instanceId": "instance-test-1"}, "red"),
+                ("tap", {"x": 959, "y": 1365, "instanceId": "instance-test-1"}, "green"),
+            ],
+            "missing": [
+                ("start_app", {"packageName": "com.android.deskclock", "instanceId": "instance-test-1"}, "blue"),
+                ("tap", {"x": 972, "y": 1728, "instanceId": "instance-test-1"}, "yellow"),
+                ("tap", {"x": 540, "y": 960, "instanceId": "instance-test-1"}, "purple"),
+                ("tap", {"x": 864, "y": 1728, "instanceId": "instance-test-1"}, "green"),
+            ],
         }
         expected_tools = {
             "enabled": ["start_app"],
@@ -185,9 +286,9 @@ class KooPhoneAgentLoopTests(unittest.IsolatedAsyncioTestCase):
             "missing": ["start_app", "tap", "tap", "tap"],
         }
 
-        for state, screenshot_colors in cases.items():
+        for state, transitions in cases.items():
             with self.subTest(state=state):
-                transport = KooPhoneLoopTransport(screenshot_colors)
+                transport = AlarmStateTransport(transitions)
                 backend = KooPhoneDeviceBackend(
                     koophone_config(), authenticator=StaticAuthenticator(), transport=transport
                 )
@@ -222,7 +323,8 @@ class KooPhoneAgentLoopTests(unittest.IsolatedAsyncioTestCase):
                     pass
 
                 self.assertEqual([name for name, _ in transport.tool_calls if name != "get_screenshot"], expected_tools[state])
-                self.assertEqual(transport.screenshot_index, len(screenshot_colors))
+                self.assertFalse(transport.transitions)
+                self.assertEqual(agent.last_terminal_reason, "completed")
 
 
 if __name__ == "__main__":

@@ -216,6 +216,7 @@ TerminalReason = Literal[
     "cancelled",
     "client_disconnected",
     "runtime_failed",
+    "unsafe_retry_blocked",
     "runtime_ended",
 ]
 SafeIdentifier = Annotated[
@@ -406,6 +407,9 @@ class ExperimentRun:
             max(0, observation_images_used), self.OBSERVATION_WINDOW_SIZE
         )
         with self._record_lock:
+            if terminal_reason is not None and self.terminal_reason is None:
+                # Business completion is independent from best-effort telemetry.
+                self.terminal_reason = terminal_reason
             self.recorder.write(
                 RunRecord(
                     run_id=self.run_id,
@@ -440,7 +444,6 @@ class ExperimentRun:
             self._last_observation_images_used = images_used
             if terminal_reason is not None:
                 self._terminal_recorded = True
-                self.terminal_reason = terminal_reason
 
     def try_record_step(self, **kwargs: Any) -> bool:
         """Best-effort telemetry that can never alter Agent execution."""
@@ -482,6 +485,10 @@ class ExperimentRun:
         with self._record_lock:
             if self._terminal_recorded:
                 return False
+            if self.terminal_reason is None:
+                # Preserve a previously reached business outcome even if its
+                # telemetry write failed and this fallback marker is attempted.
+                self.terminal_reason = terminal_reason
             self.recorder.write(
                 RunRecord(
                     run_id=self.run_id,
@@ -505,7 +512,6 @@ class ExperimentRun:
                 )
             )
             self._terminal_recorded = True
-            self.terminal_reason = terminal_reason
             return True
 
     def try_record_terminal_once(self, terminal_reason: TerminalReason) -> bool:
