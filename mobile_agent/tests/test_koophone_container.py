@@ -13,11 +13,44 @@ from unittest.mock import patch
 from mobile_agent.agent.provider import ProviderConfigurationError
 from mobile_agent.koophone_container_cli import (
     configure_private_runtime_logging,
+    main as container_main,
     validate_container_runtime,
 )
 
 
 class KooPhoneContainerRuntimeTests(unittest.TestCase):
+    def test_acceptance_subcommand_keeps_container_preflight(self):
+        settings = unittest.mock.Mock()
+        with (
+            patch(
+                "mobile_agent.koophone_container_cli.validate_container_runtime"
+            ) as validate,
+            patch(
+                "mobile_agent.koophone_container_cli.get_settings",
+                return_value=settings,
+            ),
+            patch(
+                "mobile_agent.koophone_container_cli.acceptance_main",
+                return_value=0,
+            ) as acceptance,
+        ):
+            result = container_main(
+                [
+                    "acceptance",
+                    "--output-dir",
+                    "/output",
+                    "--attest-no-manual-intervention",
+                ]
+            )
+
+        validate.assert_called_once()
+        settings.get_kimi_config.assert_called_once_with()
+        settings.get_koophone_config.assert_called_once_with()
+        acceptance.assert_called_once_with(
+            ["--output-dir", "/output", "--attest-no-manual-intervention"]
+        )
+        self.assertEqual(result, 0)
+
     def test_container_suppresses_credential_adjacent_network_endpoints(self):
         logger_names = ("httpx", "httpcore", "mcp.client.streamable_http")
         previous_levels = {
@@ -82,6 +115,9 @@ class KooPhoneContainerDefinitionTests(unittest.TestCase):
         self.assertIn("MOBILE_CONFIG_PATH=/opt/mobile-agent/config.toml", dockerfile)
         self.assertIn("mobile_agent.koophone_container_cli", dockerfile)
         self.assertIn("secret-bearing", dockerfile)
+        self.assertIn(
+            "find mobile_agent -type f ! -name '*.py' -delete", dockerfile
+        )
 
 
 if __name__ == "__main__":

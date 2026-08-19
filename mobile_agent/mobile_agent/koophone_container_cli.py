@@ -13,6 +13,7 @@ import sys
 
 from mobile_agent.agent.provider import ProviderConfigurationError
 from mobile_agent.config.settings import get_settings
+from mobile_agent.koophone_acceptance import main as acceptance_main
 from mobile_agent.koophone_alarm_cli import main as alarm_main
 
 
@@ -45,7 +46,7 @@ def validate_container_runtime(*, key_path: Path) -> None:
         )
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> int:
     configure_private_runtime_logging()
     print(
         "WARNING: secret-bearing internal KooPhone POC image; "
@@ -63,8 +64,18 @@ def main() -> None:
     except ProviderConfigurationError as error:
         print(f"KOOPHONE_POC_CONTAINER=failed reason={error}", file=sys.stderr)
         raise SystemExit(2) from None
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] == "acceptance":
+        return acceptance_main(arguments[1:])
+    if arguments:
+        print(
+            "KOOPHONE_POC_CONTAINER=failed reason=unknown_command",
+            file=sys.stderr,
+        )
+        return 2
     alarm_main()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

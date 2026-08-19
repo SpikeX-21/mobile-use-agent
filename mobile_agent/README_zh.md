@@ -216,6 +216,17 @@ docker run --rm --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m \
 docker image rm mobile-use-koophone-poc:local-secret-bearing
 ```
 
+若要执行 Issue #18 的完整实机交付矩阵（准备禁用状态、启用、已启用识别、幂等重复），
+请按 [Kimi K2.6 + KooPhone 容器 Demo 交付与验收](../docs/koophone-container-demo-delivery.md)
+构建镜像，并在容器入口后增加：
+
+```bash
+acceptance --output-dir /output --attest-no-manual-intervention
+```
+
+该命令只以最新真实截图作为完成证据；任一阶段失败都会非零退出，且输出会经过凭据、
+截图和实例信息检查。
+
 ## 🛠️ 核心组件
 
 通过 Mobile Use MCP 支持的移动设备操作：

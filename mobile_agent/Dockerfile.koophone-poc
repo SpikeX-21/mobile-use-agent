@@ -12,7 +12,9 @@ COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 COPY mobile_agent ./mobile_agent
-RUN uv sync --frozen --no-dev --no-editable \
+RUN find mobile_agent -type f ! -name '*.py' -delete \
+    && test -z "$(find mobile_agent -type f ! -name '*.py' -print -quit)" \
+    && uv sync --frozen --no-dev --no-editable \
     && rm -rf /root/.cache /tmp/*
 
 FROM python:3.11.13-slim-bookworm

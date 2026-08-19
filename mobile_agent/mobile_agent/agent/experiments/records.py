@@ -68,6 +68,10 @@ _SECRET_VALUE_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
     re.compile(r"\bark-[A-Za-z0-9-]{20,}\b"),
     re.compile(r"\bAKLT[A-Za-z0-9]{12,}\b"),
+    re.compile(
+        r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\."
+        r"[A-Za-z0-9_-]{8,}\b"
+    ),
 )
 
 
