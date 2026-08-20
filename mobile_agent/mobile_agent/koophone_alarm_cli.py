@@ -12,7 +12,7 @@ from typing import Callable
 
 from mobile_agent.agent.mobile_use_agent import MobileUseAgent
 from mobile_agent.agent.provider import ProviderConfigurationError
-from mobile_agent.koophone_cli import run_koophone_vision_demo
+from mobile_agent.koophone_task import run_koophone_task
 
 
 ALARM_PROMPT = """请确保云手机中存在一个已启用的 09:00 闹钟。
@@ -31,15 +31,16 @@ async def run_koophone_alarm_demo(
 ) -> int:
     """Run the idempotent 09:00 alarm task via the production Kimi adapter."""
 
-    outcome: list[str | None] = []
-    chunk_count = await run_koophone_vision_demo(
+    result = await run_koophone_task(
         ALARM_PROMPT,
         agent_factory=agent_factory,
-        outcome_sink=outcome.append,
     )
-    if outcome != ["completed"]:
-        raise RuntimeError(f"KooPhone alarm task did not complete: {outcome[0] if outcome else 'unknown'}")
-    return chunk_count
+    if not result.completed:
+        raise RuntimeError(
+            "KooPhone alarm task did not complete: "
+            f"{result.terminal_reason}"
+        )
+    return result.rounds
 
 
 def main() -> None:
@@ -48,11 +49,11 @@ def main() -> None:
     )
     parser.parse_args()
     try:
-        chunk_count = asyncio.run(run_koophone_alarm_demo())
+        round_count = asyncio.run(run_koophone_alarm_demo())
     except (ProviderConfigurationError, RuntimeError) as error:
         print(f"KOOPHONE_ALARM_DEMO=failed reason={error}", file=sys.stderr)
         raise SystemExit(1) from None
-    print(f"KOOPHONE_ALARM_DEMO=finished chunks={chunk_count}")
+    print(f"KOOPHONE_ALARM_DEMO=finished rounds={round_count}")
 
 
 if __name__ == "__main__":

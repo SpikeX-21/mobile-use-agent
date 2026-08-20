@@ -62,9 +62,31 @@ def _retry_would_exceed_step_limit(state: MobileUseAgentState) -> bool:
     return state.get("iteration_count", 0) >= state.get("max_iterations", 10)
 
 
-def _set_terminal_failure(
-    state: MobileUseAgentState, reason: str, device_backend=None
+def _mark_business_terminal(
+    state: MobileUseAgentState,
+    terminal_reason: str,
+    *,
+    summary: str | None = None,
 ) -> None:
+    """Update the in-memory business outcome, independent of telemetry."""
+
+    run_state = agent_object_manager.get_run_state(state.get("thread_id"))
+    if run_state is None:
+        return
+    if terminal_reason == "completed":
+        run_state.complete(summary)
+    else:
+        run_state.fail(terminal_reason)
+
+
+def _set_terminal_failure(
+    state: MobileUseAgentState,
+    reason: str,
+    device_backend=None,
+    *,
+    terminal_reason: str = "runtime_failed",
+) -> None:
+    _mark_business_terminal(state, terminal_reason)
     failure = FailAction(reason=reason)
     if device_backend is not None:
         try:
@@ -126,6 +148,9 @@ async def model_node(state: MobileUseAgentState) -> MobileUseAgentState:
     model_provider = agent_object_manager.get_model_provider(state.get("thread_id"))
     context_manager = agent_object_manager.get_context_manager(state.get("thread_id"))
     iteration_count = state.get("iteration_count")
+    run_state = agent_object_manager.get_run_state(state.get("thread_id"))
+    if run_state is not None:
+        run_state.observe_round(iteration_count + 1)
     state.update(model_latency_ms=0, observation_images_used=0)
 
     # 获取截图
@@ -234,7 +259,12 @@ async def tool_valid_node(state: MobileUseAgentState) -> MobileUseAgentState:
                 ),
             ),
         )
-        _set_terminal_failure(state, state.get("terminal_reason"), device_backend)
+        _set_terminal_failure(
+            state,
+            state.get("terminal_reason"),
+            device_backend,
+            terminal_reason=state.get("experiment_terminal_reason") or "runtime_failed",
+        )
         return state
     try:
         action = model_provider.parse_action(tool_call_str)
@@ -251,7 +281,10 @@ async def tool_valid_node(state: MobileUseAgentState) -> MobileUseAgentState:
                 ),
             )
             _set_terminal_failure(
-                state, "模型动作连续 3 次未通过 Schema 校验", device_backend
+                state,
+                "模型动作连续 3 次未通过 Schema 校验",
+                device_backend,
+                terminal_reason="schema_error_limit",
             )
             return state
         if _retry_would_exceed_step_limit(state):
@@ -265,7 +298,10 @@ async def tool_valid_node(state: MobileUseAgentState) -> MobileUseAgentState:
                 ),
             )
             _set_terminal_failure(
-                state, "任务达到 10 步上限，已安全终止", device_backend
+                state,
+                "任务达到 10 步上限，已安全终止",
+                device_backend,
+                terminal_reason="step_limit",
             )
             return state
         state.update(
@@ -323,6 +359,7 @@ async def tool_valid_node(state: MobileUseAgentState) -> MobileUseAgentState:
                     state,
                     "ADB 独立 Oracle 连续两次未满足完成条件",
                     device_backend,
+                    terminal_reason="oracle_rejected",
                 )
                 return state
             else:
@@ -340,7 +377,10 @@ async def tool_valid_node(state: MobileUseAgentState) -> MobileUseAgentState:
                         ),
                     )
                     _set_terminal_failure(
-                        state, "任务达到 10 步上限，已安全终止", device_backend
+                        state,
+                        "任务达到 10 步上限，已安全终止",
+                        device_backend,
+                        terminal_reason="step_limit",
                     )
                     return state
                 state.update(
@@ -384,7 +424,10 @@ async def tool_valid_node(state: MobileUseAgentState) -> MobileUseAgentState:
                 ),
             )
             _set_terminal_failure(
-                state, "任务达到 10 步上限，已安全终止", device_backend
+                state,
+                "任务达到 10 步上限，已安全终止",
+                device_backend,
+                terminal_reason="step_limit",
             )
             return state
         state.update(
@@ -409,6 +452,7 @@ async def tool_valid_node(state: MobileUseAgentState) -> MobileUseAgentState:
     state.update(action=action, tool_call=tool_call)
 
     if isinstance(action, FinishAction):
+        _mark_business_terminal(state, "completed", summary=action.summary)
         _record_experiment_step(
             state,
             StepOutcome(
@@ -434,6 +478,7 @@ async def tool_valid_node(state: MobileUseAgentState) -> MobileUseAgentState:
         )
         state.update(tool_output="上一轮任务已经完成，更多的根据用户新的输入完成任务")
     elif isinstance(action, FailAction):
+        _mark_business_terminal(state, "model_failed")
         _record_experiment_step(
             state,
             StepOutcome(
@@ -526,7 +571,10 @@ async def tool_node(state: MobileUseAgentState) -> MobileUseAgentState:
     if action_result.error_kind is DeviceErrorKind.OFFLINE:
         terminal_reason = "device_offline"
         _set_terminal_failure(
-            state, f"设备离线：{action_result.message}", device_backend
+            state,
+            f"设备离线：{action_result.message}",
+            device_backend,
+            terminal_reason=terminal_reason,
         )
     elif action_result.status is ActionResultStatus.REJECTED:
         terminal_reason = "unsafe_retry_blocked"
@@ -534,11 +582,15 @@ async def tool_node(state: MobileUseAgentState) -> MobileUseAgentState:
             state,
             f"已阻止失败或不确定回执后的同一副作用动作重放：{action_result.message}",
             device_backend,
+            terminal_reason=terminal_reason,
         )
     elif state.get("iteration_count", 0) >= state.get("max_iterations", 10):
         terminal_reason = "step_limit"
         _set_terminal_failure(
-            state, "任务达到 10 步上限，已安全终止", device_backend
+            state,
+            "任务达到 10 步上限，已安全终止",
+            device_backend,
+            terminal_reason=terminal_reason,
         )
 
     else:

@@ -19,6 +19,7 @@ from mobile_agent.agent.llm.provider import (
     ModelProvider,
     create_model_provider,
 )
+from mobile_agent.agent.provider import ProviderConfigurationError
 from mobile_agent.agent.mobile.backend import (
     DeviceBackend,
     create_device_backend,
@@ -33,6 +34,7 @@ from mobile_agent.agent.experiments.records import (
 )
 from mobile_agent.agent.mobile.result import classify_device_error
 from mobile_agent.exception.sse import SSEException
+from mobile_agent.agent.run_result import AgentRunResult, AgentRunState
 
 
 class MobileUseAgent:
@@ -66,6 +68,29 @@ class MobileUseAgent:
         )
         self.cost_calculator = CostCalculator(MobileUseAgent.name)
         self.last_terminal_reason: str | None = None
+        self.last_run_result: AgentRunResult | None = None
+
+    def get_last_run_result(
+        self,
+        *,
+        elapsed_ms: int | None = None,
+    ) -> AgentRunResult | None:
+        """Return the public business outcome of the most recent run."""
+
+        if self.last_run_result is not None:
+            if elapsed_ms is None:
+                return self.last_run_result
+            return AgentRunResult(
+                status=self.last_run_result.status,
+                task_id=self.last_run_result.task_id,
+                thread_id=self.last_run_result.thread_id,
+                session_id=self.last_run_result.session_id,
+                result=self.last_run_result.result,
+                rounds=self.last_run_result.rounds,
+                elapsed_ms=max(0, elapsed_ms),
+                terminal_reason=self.last_run_result.terminal_reason,
+            )
+        return None
 
     async def initialize(
         self,
@@ -108,6 +133,13 @@ class MobileUseAgent:
         run_id = str(uuid.uuid4())
         recorder = JsonlExperimentRecorder(self.experiment_record_path)
         experiment_run: ExperimentRun | None = None
+        run_state = AgentRunState(
+            task_id=task_id,
+            thread_id=thread_id,
+            session_id=session_id,
+        )
+        self.last_run_result = None
+        self.last_terminal_reason = None
         self.logger.set_context(thread_id=session_id, chat_thread_id=thread_id)
         self.task_id = task_id
         self.stream = is_stream
@@ -129,22 +161,33 @@ class MobileUseAgent:
                 "observation_images_used": 0,
                 "step_interval": self.step_interval,
             }
+
+            def record_provider_failure() -> None:
+                fallback_run = ExperimentRun(
+                    recorder=recorder,
+                    query=query,
+                    provider="unknown",
+                    model="unknown",
+                    device_provider=str(
+                        getattr(self.device_backend, "name", "unknown")
+                    ),
+                    run_id=run_id,
+                )
+                fallback_run.try_record_terminal_once("runtime_failed")
+
             try:
                 model_provider = self._model_provider_factory(
                     self.model_provider_name,
                     thread_id=thread_id,
                     is_stream=is_stream,
                 )
+            except ProviderConfigurationError:
+                run_state.fail("provider_configuration")
+                record_provider_failure()
+                raise
             except Exception:
-                fallback_run = ExperimentRun(
-                    recorder=recorder,
-                    query=query,
-                    provider="unknown",
-                    model="unknown",
-                    device_provider=str(getattr(self.device_backend, "name", "unknown")),
-                    run_id=run_id,
-                )
-                fallback_run.try_record_terminal_once("runtime_failed")
+                run_state.fail("runtime_failed")
+                record_provider_failure()
                 raise
             experiment_run = ExperimentRun(
                 recorder=recorder,
@@ -161,6 +204,7 @@ class MobileUseAgent:
                 sse_connection=sse_connection,
                 cost_calculator=self.cost_calculator,
                 experiment_run=experiment_run,
+                run_state=run_state,
             )
 
             prepare_task = getattr(self.device_backend, "prepare_task", None)
@@ -169,8 +213,10 @@ class MobileUseAgent:
                 try:
                     await prepare_task(query)
                 except asyncio.CancelledError:
+                    run_state.fail("cancelled")
                     raise
                 except Exception as exc:
+                    run_state.fail("prepare_failed")
                     error_kind = classify_device_error(exc)
                     experiment_run.try_record_step(
                         step_number=1,
@@ -204,27 +250,32 @@ class MobileUseAgent:
             ):
                 yield chunk
         except asyncio.CancelledError:
+            run_state.fail("cancelled")
             if experiment_run is not None:
                 experiment_run.try_record_terminal_once("cancelled")
             raise
         except SSEException:
+            run_state.fail("client_disconnected")
             if experiment_run is not None:
                 experiment_run.try_record_terminal_once("client_disconnected")
             raise
         except GeneratorExit:
+            run_state.fail("client_disconnected")
             if experiment_run is not None:
                 experiment_run.try_record_terminal_once("client_disconnected")
             raise
         except Exception:
+            run_state.fail("runtime_failed")
             if experiment_run is not None:
                 experiment_run.try_record_terminal_once("runtime_failed")
             raise
         finally:
-            if experiment_run is not None:
-                self.last_terminal_reason = experiment_run.terminal_reason
+            if run_state.terminal_reason is None:
+                run_state.fail("runtime_failed")
+            self.last_run_result = run_state.to_result()
+            self.last_terminal_reason = self.last_run_result.terminal_reason
             if experiment_run is not None:
                 experiment_run.try_record_terminal_once("runtime_ended")
-                self.last_terminal_reason = experiment_run.terminal_reason
             if self.stream:
                 self.logger.info("stream mode, not support cost calculator")
             else:

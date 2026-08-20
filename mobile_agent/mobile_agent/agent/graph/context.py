@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from mobile_agent.agent.experiments.records import ExperimentRun
     from mobile_agent.agent.llm.provider import ModelProvider
     from mobile_agent.agent.mobile.backend import DeviceBackend
+    from mobile_agent.agent.run_result import AgentRunState
 
 
 class AgentObjectManager:
@@ -34,6 +35,7 @@ class AgentObjectManager:
         sse_connection: asyncio.Event,
         cost_calculator: CostCalculator,
         experiment_run: "ExperimentRun",
+        run_state: "AgentRunState | None" = None,
     ):
         """为特定thread_id创建上下文"""
         self._contexts[thread_id] = {
@@ -42,6 +44,7 @@ class AgentObjectManager:
             "sse_connection": sse_connection,
             "cost_calculator": cost_calculator,
             "experiment_run": experiment_run,
+            "run_state": run_state,
         }
 
     def add_context_object(
@@ -70,6 +73,9 @@ class AgentObjectManager:
 
     def get_experiment_run(self, thread_id: str) -> Optional["ExperimentRun"]:
         return self._contexts.get(thread_id, {}).get("experiment_run")
+
+    def get_run_state(self, thread_id: str) -> Optional["AgentRunState"]:
+        return self._contexts.get(thread_id, {}).get("run_state")
 
     def destroy_context(self, thread_id: str):
         """清理特定thread_id的上下文"""
