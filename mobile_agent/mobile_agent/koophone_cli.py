@@ -8,9 +8,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import sys
 from typing import Callable
 import uuid
 
+from mobile_agent.agent.provider import ProviderConfigurationError
 from mobile_agent.agent.mobile_use_agent import MobileUseAgent
 
 
@@ -50,7 +52,18 @@ async def run_koophone_vision_demo(
         await agent.aclose()
 
 
-def main() -> None:
+async def run_koophone_vision_task(prompt: str) -> tuple[int, str | None]:
+    """Return both stream activity and the Agent's authoritative terminal state."""
+
+    outcome: list[str | None] = []
+    chunk_count = await run_koophone_vision_demo(
+        prompt,
+        outcome_sink=outcome.append,
+    )
+    return chunk_count, outcome[-1] if outcome else None
+
+
+def main() -> int:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     parser = argparse.ArgumentParser(
@@ -58,9 +71,32 @@ def main() -> None:
     )
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     arguments = parser.parse_args()
-    chunk_count = asyncio.run(run_koophone_vision_demo(arguments.prompt))
+    try:
+        chunk_count, terminal_reason = asyncio.run(
+            run_koophone_vision_task(arguments.prompt)
+        )
+    except ProviderConfigurationError:
+        print(
+            "KOOPHONE_VISION_DEMO=failed reason=provider_configuration",
+            file=sys.stderr,
+        )
+        return 2
+    except Exception:
+        print(
+            "KOOPHONE_VISION_DEMO=failed reason=runtime_error",
+            file=sys.stderr,
+        )
+        return 1
+    if terminal_reason != "completed":
+        print(
+            "KOOPHONE_VISION_DEMO=failed "
+            f"reason={terminal_reason or 'runtime_ended'} chunks={chunk_count}",
+            file=sys.stderr,
+        )
+        return 1
     print(f"KOOPHONE_VISION_DEMO=finished chunks={chunk_count}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import io
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from mobile_agent.agent.provider import ProviderConfigurationError
-from mobile_agent.koophone_cli import run_koophone_vision_demo
+from mobile_agent.koophone_cli import (
+    main as vision_main,
+    run_koophone_vision_demo,
+)
 from mobile_agent.koophone_alarm_cli import (
     ALARM_PROMPT,
     main as alarm_main,
@@ -80,6 +83,63 @@ class KooPhoneCliTests(unittest.IsolatedAsyncioTestCase):
 
 
 class KooPhoneCliMainTests(unittest.TestCase):
+    def test_generic_vision_cli_fails_when_agent_terminal_is_not_completed(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            patch("sys.argv", ["koophone-vision", "--prompt", "测试任务"]),
+            patch(
+                "mobile_agent.koophone_cli.run_koophone_vision_task",
+                new=AsyncMock(return_value=(3, "device_observation_failed")),
+            ),
+            patch("sys.stdout", stdout),
+            patch("sys.stderr", stderr),
+        ):
+            result = vision_main()
+
+        self.assertEqual(result, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(
+            stderr.getvalue(),
+            "KOOPHONE_VISION_DEMO=failed "
+            "reason=device_observation_failed chunks=3\n",
+        )
+
+    def test_generic_vision_cli_reports_finished_only_for_completed_terminal(self):
+        stdout = io.StringIO()
+        with (
+            patch("sys.argv", ["koophone-vision", "--prompt", "测试任务"]),
+            patch(
+                "mobile_agent.koophone_cli.run_koophone_vision_task",
+                new=AsyncMock(return_value=(2, "completed")),
+            ),
+            patch("sys.stdout", stdout),
+        ):
+            result = vision_main()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stdout.getvalue(), "KOOPHONE_VISION_DEMO=finished chunks=2\n")
+
+    def test_generic_vision_cli_returns_nonzero_for_configuration_failure(self):
+        stderr = io.StringIO()
+        with (
+            patch("sys.argv", ["koophone-vision"]),
+            patch(
+                "mobile_agent.koophone_cli.run_koophone_vision_task",
+                new=AsyncMock(
+                    side_effect=ProviderConfigurationError("test-only")
+                ),
+            ),
+            patch("sys.stderr", stderr),
+        ):
+            result = vision_main()
+
+        self.assertEqual(result, 2)
+        self.assertEqual(
+            stderr.getvalue(),
+            "KOOPHONE_VISION_DEMO=failed reason=provider_configuration\n",
+        )
+
     def test_authentication_probe_failure_exits_cleanly_before_llm_work(self):
         def fail_authentication(coroutine):
             coroutine.close()
