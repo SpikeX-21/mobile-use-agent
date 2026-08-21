@@ -32,7 +32,8 @@ POST https://<访问域名>/runtimes/mobile-use-koophone-poc-test1/invocations?e
 }
 ```
 
-能力查询不调用 Kimi 或 KooPhone MCP，也不要求 Session Header。
+能力查询不调用 Kimi 或 KooPhone MCP。Runtime 处理函数本身不消费 Session Header，
+但 AgentArts 公网 Gateway 仍要求 `X-Hw-Agentarts-Session-Id`；公网调用必须携带。
 
 ## 同步任务
 
@@ -122,3 +123,36 @@ HTTP 400。
 - 本地镜像：`mobile-use-agent-agentarts:invocation-operations`
 
 旧 Runtime `mobile-use-koophone-poc`、其 `dev → v8` 映射和原入站 Key 不会被本次部署覆盖。
+
+## 真实发布与验收证据
+
+2026-08-21 已从提交 `542fb74` 构建并发布：
+
+| 项目 | 结果 |
+| --- | --- |
+| Runtime | `mobile-use-koophone-poc-test1` / `ef570f2e-a525-44a8-a4c3-27e7eed69839` |
+| version | `v1` |
+| Endpoint | `dev` / `6dccea53-5c42-4267-9854-051b72c3bb52`，固定到 `v1` |
+| Gateway | `defaultgw-grstqnldg5.cn-southwest-2.huaweicloud-agentarts.com` |
+| SWR repository | `agentarts-cnso2-80c86dae-org/agent_mobile-use-koophone-poc-test1`，私有 |
+| image tag | `issue25-542fb74-20260821t154214z` |
+| image digest | `sha256:9551c41662ed5460ddef5a184582c6174971396603856e7a95aa96a39f6d315e` |
+| image contract | `linux/arm64`、SDK `0.1.5`、非 OCI media type、只读非 root 容器测试通过 |
+| 入站认证 | 独立 API Key，仅存于忽略目录；没有复用旧 Runtime Key |
+| Runtime 配置 | HTTP 8080、PUBLIC 出站、文件传输关闭、session storage 关闭 |
+| 可观测性 | 当前新 Runtime 的 logs/metrics/tracing 均关闭 |
+
+公网串行验收：
+
+- `query_capabilities`：HTTP 200，三个能力均为 `true`，没有调用模型或设备。
+- `chat_completions`：真实 Kimi K2.6 + KooPhone MCP 只读应用列表，HTTP 200
+  `completed`，2 轮，Agent 耗时 26,507 ms，Session Header 一致。
+- `create_response`：立即返回 `resp_<UUID>` 与 `in_progress`。
+- 对同一 Session 执行 `fetch_response`：处理中持续返回 HTTP 200
+  `in_progress`；第 14 次查询返回 HTTP 200 `completed`，2 轮，Agent 耗时
+  28,246 ms。
+- 异步失败验收：只观察截图并使用 Agent 本地 `fail`，没有设备副作用；第 6 次查询
+  返回 HTTP 200 `failed`，1 轮，Agent 耗时 9,377 ms，
+  `terminal_reason=model_failed`，且包含完整 task/thread/session 标识。
+
+本地全套 295 项测试通过；另行启用的 7 项真实 Docker 镜像测试全部通过。
