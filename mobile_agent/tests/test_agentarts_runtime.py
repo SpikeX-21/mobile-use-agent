@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -19,9 +20,11 @@ from mobile_agent.agentarts_runtime import (
     MAX_INPUT_LENGTH,
     app,
     configure_runtime_logging,
+    FIXED_DEVICE_SLOT,
     main,
     runtime_health,
 )
+from mobile_agent.runtime.device_lease import InProcessDeviceLease
 
 
 def completed_result(*, task_id: str = "task-1", session_id: str = "session-1") -> AgentRunResult:
@@ -57,11 +60,20 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
             transport=self.transport,
             base_url="http://runtime.test",
         )
+        self.lease_provider = InProcessDeviceLease()
+        self.lease_patcher = patch(
+            "mobile_agent.agentarts_runtime.device_lease_provider",
+            new=self.lease_provider,
+        )
+        self.lease_patcher.start()
         runtime_health.set_ready(True)
+        runtime_health.set_busy(False)
 
     async def asyncTearDown(self) -> None:
         await self.client.aclose()
+        self.lease_patcher.stop()
         runtime_health.set_ready(True)
+        runtime_health.set_busy(False)
 
     async def invoke(self, payload: object, *, session_id: str = "session-test") -> httpx.Response:
         return await self.client.post(
@@ -86,6 +98,144 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "Unhealthy")
+
+    async def test_ping_reports_healthy_busy_while_the_fixed_device_is_occupied(self):
+        started = asyncio.Event()
+        finish = asyncio.Event()
+
+        async def blocking_runner(prompt, **kwargs):
+            started.set()
+            await finish.wait()
+            return completed_result(task_id=kwargs["task_id"])
+
+        with patch(
+            "mobile_agent.agentarts_runtime.run_koophone_task",
+            new=blocking_runner,
+        ):
+            request = asyncio.create_task(self.invoke({"input": "长任务"}))
+            await asyncio.wait_for(started.wait(), timeout=0.2)
+
+            busy_ping = await self.client.get("/ping")
+            self.assertEqual(busy_ping.status_code, 200)
+            self.assertEqual(busy_ping.json()["status"], "HealthyBusy")
+
+            finish.set()
+            response = await request
+
+        self.assertEqual(response.status_code, 200)
+        idle_ping = await self.client.get("/ping")
+        self.assertEqual(idle_ping.json()["status"], "Healthy")
+
+    async def test_busy_request_is_rejected_before_agent_and_uses_server_fixed_slot(self):
+        lease = await self.lease_provider.try_acquire(FIXED_DEVICE_SLOT)
+        self.assertIsNotNone(lease)
+
+        with patch("mobile_agent.agentarts_runtime.run_koophone_task", new=AsyncMock()) as runner:
+            response = await self.invoke({"input": "第二个任务"})
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json(), {"error": "device_busy"})
+        runner.assert_not_awaited()
+        self.assertTrue(self.lease_provider.busy)
+        await lease.release()
+
+    async def test_failed_and_exception_runs_release_slot_for_next_request(self):
+        runner = AsyncMock(
+            side_effect=[
+                failed_result("step_limit"),
+                RuntimeError("provider details"),
+                completed_result(task_id="task-after-failure"),
+            ]
+        )
+
+        with patch("mobile_agent.agentarts_runtime.run_koophone_task", new=runner):
+            failed = await self.invoke({"input": "失败任务"})
+            errored = await self.invoke({"input": "异常任务"})
+            recovered = await self.invoke({"input": "恢复任务"})
+
+        self.assertEqual(failed.status_code, 422)
+        self.assertEqual(errored.status_code, 500)
+        self.assertEqual(recovered.status_code, 200)
+        self.assertFalse(self.lease_provider.busy)
+
+    async def test_timeout_cancels_runner_waits_for_cleanup_and_releases_slot(self):
+        cancelled = asyncio.Event()
+        calls = 0
+
+        async def timeout_runner(prompt, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+            return completed_result(task_id=kwargs["task_id"])
+
+        with patch.dict(os.environ, {"AGENT_TASK_TIMEOUT_SECONDS": "0.01"}), patch(
+            "mobile_agent.agentarts_runtime.run_koophone_task",
+            new=timeout_runner,
+        ):
+            timed_out = await self.invoke({"input": "超时任务"})
+            recovered = await self.invoke({"input": "超时后任务"})
+
+        self.assertEqual(timed_out.status_code, 504)
+        self.assertEqual(timed_out.json()["error"], "task_timeout")
+        self.assertEqual(timed_out.json()["terminal_reason"], "timeout")
+        self.assertEqual(recovered.status_code, 200)
+        self.assertTrue(cancelled.is_set())
+        self.assertFalse(self.lease_provider.busy)
+
+    async def test_client_cancellation_releases_slot_for_next_request(self):
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+        calls = 0
+
+        async def cancellable_runner(prompt, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                return completed_result(task_id=kwargs["task_id"])
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        with patch(
+            "mobile_agent.agentarts_runtime.run_koophone_task",
+            new=cancellable_runner,
+        ):
+            request = asyncio.create_task(self.invoke({"input": "取消任务"}))
+            await asyncio.wait_for(started.wait(), timeout=0.2)
+            request.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await request
+
+            recovered = await self.invoke({"input": "取消后任务"})
+
+        self.assertTrue(cancelled.is_set())
+        self.assertEqual(recovered.status_code, 200)
+        self.assertFalse(self.lease_provider.busy)
+
+    async def test_invalid_task_timeout_is_rejected_before_agent(self):
+        for raw_timeout in ("not-a-number", "0", "nan", "inf"):
+            with self.subTest(raw_timeout=raw_timeout):
+                with patch.dict(
+                    os.environ,
+                    {"AGENT_TASK_TIMEOUT_SECONDS": raw_timeout},
+                ), patch(
+                    "mobile_agent.agentarts_runtime.run_koophone_task",
+                    new=AsyncMock(),
+                ) as runner:
+                    response = await self.invoke({"input": "任务"})
+
+                self.assertEqual(response.status_code, 500)
+                self.assertEqual(response.json(), {"error": "runtime_failed"})
+                runner.assert_not_awaited()
+                self.assertFalse(self.lease_provider.busy)
 
     async def test_invalid_input_is_rejected_before_agent(self):
         invalid_payloads = [
@@ -135,10 +285,13 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), result.to_dict())
         self.assertEqual(response.headers[SESSION_HEADER], "session-42")
-        runner.assert_awaited_once_with(
-            "根据会议号开启快速会议",
-            session_id="session-42",
-        )
+        runner.assert_awaited_once()
+        call = runner.await_args
+        self.assertEqual(call.args, ("根据会议号开启快速会议",))
+        self.assertEqual(call.kwargs["session_id"], "session-42")
+        self.assertTrue(call.kwargs["task_id"].startswith("koophone-task-"))
+        self.assertTrue(call.kwargs["thread_id"].startswith("koophone-thread-"))
+        self.assertTrue(call.kwargs["propagate_cancellation"])
 
     async def test_repeated_session_id_starts_independent_tasks(self):
         results = [
@@ -233,7 +386,7 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
         root_logger = logging.getLogger()
         root_logger.addHandler(capture)
 
-        async def exploding_runner(prompt, *, session_id):
+        async def exploding_runner(prompt, *, session_id, **kwargs):
             logging.getLogger("mobile_agent.agent.mobile.client").error(
                 "upstream URL https://device.example/internal?token=secret-token",
                 exc_info=RuntimeError("provider-private-details"),

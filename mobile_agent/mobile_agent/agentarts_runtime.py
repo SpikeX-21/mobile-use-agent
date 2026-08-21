@@ -12,9 +12,13 @@ MobileUseAgent graph or expose the outer Gateway ``/runtimes/...`` path.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import math
 import os
 import re
+import time
+import uuid
 from typing import Any
 
 from agentarts.sdk import AgentArtsRuntimeApp, PingStatus, RequestContext
@@ -24,9 +28,16 @@ from starlette.responses import JSONResponse
 
 from mobile_agent.agent.run_result import AgentRunResult
 from mobile_agent.koophone_task import run_koophone_task
+from mobile_agent.runtime.device_lease import (
+    DeviceLeaseHandle,
+    DeviceLeaseProvider,
+    InProcessDeviceLease,
+)
 
 
 MAX_INPUT_LENGTH = 4_096
+DEFAULT_TASK_TIMEOUT_SECONDS = 900.0
+FIXED_DEVICE_SLOT = "koophone-fixed-device"
 _SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 
 _DEVICE_FAILURE_REASONS = frozenset(
@@ -59,15 +70,22 @@ class RuntimeHealth:
 
     def __init__(self) -> None:
         self._ready = True
+        self._busy = False
 
     def set_ready(self, ready: bool) -> None:
         self._ready = bool(ready)
 
+    def set_busy(self, busy: bool) -> None:
+        self._busy = bool(busy)
+
     def status(self) -> PingStatus:
-        return PingStatus.HEALTHY if self._ready else PingStatus.UNHEALTHY
+        if not self._ready:
+            return PingStatus.UNHEALTHY
+        return PingStatus.HEALTHY_BUSY if self._busy else PingStatus.HEALTHY
 
 
 runtime_health = RuntimeHealth()
+device_lease_provider: DeviceLeaseProvider = InProcessDeviceLease()
 
 
 class RedactedInvocationErrors:
@@ -203,6 +221,26 @@ def _prompt(payload: object) -> str:
     return value
 
 
+def _task_timeout_seconds() -> float:
+    raw_timeout = os.getenv(
+        "AGENT_TASK_TIMEOUT_SECONDS", str(DEFAULT_TASK_TIMEOUT_SECONDS)
+    )
+    try:
+        timeout = float(raw_timeout)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("AGENT_TASK_TIMEOUT_SECONDS must be a number") from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("AGENT_TASK_TIMEOUT_SECONDS must be greater than zero")
+    return timeout
+
+
+def _new_task_ids() -> tuple[str, str]:
+    return (
+        f"koophone-task-{uuid.uuid4()}",
+        f"koophone-thread-{uuid.uuid4()}",
+    )
+
+
 def _failure_code(result: AgentRunResult) -> tuple[str, int]:
     if result.terminal_reason in _DEVICE_FAILURE_REASONS:
         return "device_upstream_failed", 502
@@ -224,6 +262,41 @@ def _failure_payload(result: AgentRunResult, error: str) -> dict[str, object]:
     }
 
 
+def _timeout_result(
+    *,
+    task_id: str,
+    thread_id: str,
+    session_id: str,
+    elapsed_ms: int,
+) -> AgentRunResult:
+    return AgentRunResult(
+        status="failed",
+        task_id=task_id,
+        thread_id=thread_id,
+        session_id=session_id,
+        result=None,
+        rounds=0,
+        elapsed_ms=elapsed_ms,
+        terminal_reason="timeout",
+    )
+
+
+async def _release_device_lease(lease: DeviceLeaseHandle) -> None:
+    """Await lease cleanup even when the invocation task is being cancelled."""
+
+    release_task = asyncio.create_task(lease.release())
+    try:
+        await asyncio.shield(release_task)
+    except asyncio.CancelledError:
+        try:
+            await release_task
+        except Exception:
+            logging.getLogger(__name__).exception("Device lease release failed")
+        raise
+    except Exception:
+        logging.getLogger(__name__).exception("Device lease release failed")
+
+
 @app.entrypoint
 async def invoke(
     payload: object, context: RequestContext
@@ -237,24 +310,70 @@ async def invoke(
         return _error("invalid_request", status_code=400)
 
     try:
-        result = await run_koophone_task(prompt, session_id=session_id)
-    except Exception:
-        # The task runner normally returns a structured result.  Keep this
-        # final boundary for unexpected adapter/runtime failures as well.
+        task_timeout = _task_timeout_seconds()
+    except ValueError:
         return _error("runtime_failed", status_code=500)
 
-    if not isinstance(result, AgentRunResult):
-        return _error("runtime_failed", status_code=500)
-    if result.completed:
-        # Returning a plain mapping lets the SDK add its standard session
-        # response header while retaining the stable JSON body.
-        return result.to_dict()
+    task_id, thread_id = _new_task_ids()
+    lease: DeviceLeaseHandle | None = None
+    try:
+        try:
+            lease = await device_lease_provider.try_acquire(FIXED_DEVICE_SLOT)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return _error("runtime_failed", status_code=500)
 
-    error, status_code = _failure_code(result)
-    return JSONResponse(
-        status_code=status_code,
-        content=_failure_payload(result, error),
-    )
+        if lease is None:
+            return _error("device_busy", status_code=409)
+
+        runtime_health.set_busy(True)
+        started_at = time.perf_counter()
+        try:
+            result = await asyncio.wait_for(
+                run_koophone_task(
+                    prompt,
+                    session_id=session_id,
+                    task_id=task_id,
+                    thread_id=thread_id,
+                    propagate_cancellation=True,
+                ),
+                timeout=task_timeout,
+            )
+        except asyncio.TimeoutError:
+            timeout_result = _timeout_result(
+                task_id=task_id,
+                thread_id=thread_id,
+                session_id=session_id,
+                elapsed_ms=round((time.perf_counter() - started_at) * 1000),
+            )
+            return JSONResponse(
+                status_code=504,
+                content=_failure_payload(timeout_result, "task_timeout"),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return _error("runtime_failed", status_code=500)
+
+        if not isinstance(result, AgentRunResult):
+            return _error("runtime_failed", status_code=500)
+        if result.completed:
+            # Returning a plain mapping lets the SDK add its standard session
+            # response header while retaining the stable JSON body.
+            return result.to_dict()
+
+        error, status_code = _failure_code(result)
+        return JSONResponse(
+            status_code=status_code,
+            content=_failure_payload(result, error),
+        )
+    finally:
+        if lease is not None:
+            try:
+                await _release_device_lease(lease)
+            finally:
+                runtime_health.set_busy(False)
 
 
 @app.ping

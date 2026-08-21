@@ -188,6 +188,49 @@ class KooPhoneTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.terminal_reason, "cancelled")
         self.assertEqual(agent.closed, 1)
 
+    async def test_propagated_cancellation_still_closes_agent(self):
+        agent = FakeAgent()
+
+        async def cancelled_run(prompt, **kwargs):
+            raise asyncio.CancelledError
+            yield  # pragma: no cover
+
+        agent.run = cancelled_run
+        with self.assertRaises(asyncio.CancelledError):
+            await run_koophone_task(
+                "打开应用",
+                agent_factory=lambda **kwargs: agent,
+                propagate_cancellation=True,
+            )
+
+        self.assertEqual(agent.closed, 1)
+
+    async def test_propagated_cancellation_waits_for_agent_cleanup(self):
+        cleanup_finished = asyncio.Event()
+
+        class SlowCloseAgent(FakeAgent):
+            async def aclose(self):
+                await asyncio.sleep(0.01)
+                self.closed += 1
+                cleanup_finished.set()
+
+        agent = SlowCloseAgent()
+
+        async def cancelled_run(prompt, **kwargs):
+            raise asyncio.CancelledError
+            yield  # pragma: no cover
+
+        agent.run = cancelled_run
+        with self.assertRaises(asyncio.CancelledError):
+            await run_koophone_task(
+                "打开应用",
+                agent_factory=lambda **kwargs: agent,
+                propagate_cancellation=True,
+            )
+
+        self.assertTrue(cleanup_finished.is_set())
+        self.assertEqual(agent.closed, 1)
+
     def test_result_redacts_observation_and_coordinate_summary(self):
         for summary in (
             "点击坐标 (123, 456)，截图 data:image/png;base64,secret",

@@ -52,12 +52,16 @@ async def run_koophone_task(
     task_id: str | None = None,
     thread_id: str | None = None,
     session_id: str = "koophone-runtime",
+    propagate_cancellation: bool = False,
 ) -> AgentRunResult:
     """Run one fresh Kimi + KooPhone task and return its business outcome.
 
     The caller receives a result for configuration, device, model, runtime and
     cancellation failures instead of having to infer state from log output or
     experiment JSONL.  The Agent is always closed once when it was created.
+    ``propagate_cancellation`` is reserved for an outer deadline/cancellation
+    boundary that must observe ``CancelledError`` while preserving the default
+    structured-cancellation behavior for existing callers.
     """
 
     started_at = time.perf_counter()
@@ -110,6 +114,8 @@ async def run_koophone_task(
         except asyncio.CancelledError:
             cancelled = True
             terminal_reason = "cancelled"
+            if propagate_cancellation:
+                raise
         except ProviderConfigurationError:
             terminal_reason = "provider_configuration"
         except Exception:
