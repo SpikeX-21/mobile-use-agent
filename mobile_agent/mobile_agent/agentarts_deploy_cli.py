@@ -64,8 +64,8 @@ from mobile_agent.agentarts_deployment import (
 
 COMPONENT_ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY_ROOT = COMPONENT_ROOT.parent
-LOCAL_IMAGE = "mobile-use-agent-agentarts:issue24"
-STATE_DIRECTORY = COMPONENT_ROOT / ".agentarts"
+LOCAL_IMAGE = "mobile-use-agent-agentarts:invocation-operations"
+STATE_DIRECTORY = COMPONENT_ROOT / ".agentarts" / AGENT_NAME
 STATE_PATH = STATE_DIRECTORY / "deployment-state.json"
 PENDING_STATE_PATH = STATE_DIRECTORY / "deployment-pending.json"
 INBOUND_KEY_PATH = STATE_DIRECTORY / "inbound-api-key"

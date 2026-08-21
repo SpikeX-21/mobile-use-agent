@@ -24,7 +24,7 @@ import stat
 from typing import Mapping
 
 
-AGENT_NAME = "mobile-use-koophone-poc"
+AGENT_NAME = "mobile-use-koophone-poc-test1"
 ENTRYPOINT = "app:app"
 REGION = "cn-southwest-2"
 DEPENDENCY_FILE = "requirements.txt"

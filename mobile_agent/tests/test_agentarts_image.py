@@ -268,7 +268,14 @@ async def run_koophone_task(prompt, *, task_id, thread_id, session_id, **kwargs)
                     )
 
                 def invoke(prompt: str) -> tuple[int, dict[str, object]]:
-                    body = json.dumps({"input": prompt}).encode()
+                    body = json.dumps(
+                        {
+                            "inputs": {
+                                "operation": "chat_completions",
+                                "query": prompt,
+                            }
+                        }
+                    ).encode()
                     request = urllib.request.Request(
                         "http://127.0.0.1:18080/invocations",
                         data=body,

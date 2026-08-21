@@ -13,13 +13,20 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 
-from agentarts.sdk.runtime.model import SESSION_HEADER
+from agentarts.sdk.runtime.context import AgentArtsRuntimeContext
+from agentarts.sdk.runtime.model import (
+    ACCESS_TOKEN_HEADER,
+    SESSION_HEADER,
+    USER_ID_HEADER,
+)
 
 from mobile_agent.agent.run_result import AgentRunResult
 from mobile_agent.agentarts_runtime import (
     MAX_REQUEST_BODY_BYTES,
     MAX_INPUT_LENGTH,
+    InMemoryAsyncResponseStore,
     app,
+    async_response_store,
     configure_runtime_logging,
     FIXED_DEVICE_SLOT,
     main,
@@ -71,6 +78,7 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
         self.lease_patcher.start()
         runtime_health.set_ready(True)
         runtime_health.set_busy(False)
+        async_response_store.clear()
 
     async def asyncTearDown(self) -> None:
         await self.client.aclose()
@@ -91,6 +99,24 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
             content=json.dumps(payload),
         )
 
+    async def chat(
+        self,
+        query: object,
+        *,
+        session_id: str = "session-test",
+        content_type: str = "application/json",
+    ) -> httpx.Response:
+        return await self.invoke(
+            {
+                "inputs": {
+                    "operation": "chat_completions",
+                    "query": query,
+                }
+            },
+            session_id=session_id,
+            content_type=content_type,
+        )
+
     async def test_ping_uses_sdk_wire_format_without_running_agent(self):
         with patch("mobile_agent.agentarts_runtime.run_koophone_task", new=AsyncMock()) as runner:
             response = await self.client.get("/ping")
@@ -99,6 +125,350 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
         self.assertEqual(response.json()["status"], "Healthy")
         self.assertIn("time_of_last_update", response.json())
         runner.assert_not_awaited()
+
+    async def test_query_capabilities_returns_supported_operations_without_agent(self):
+        with patch(
+            "mobile_agent.agentarts_runtime.run_koophone_task", new=AsyncMock()
+        ) as runner:
+            response = await self.client.post(
+                "/invocations",
+                headers={"content-type": "application/json"},
+                content=json.dumps(
+                    {"inputs": {"operation": "query_capabilities"}}
+                ),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {
+                "capabilities": {
+                    "chat_completions": True,
+                    "responses_api": True,
+                    "responses_get_fetch": True,
+                }
+            },
+        )
+        runner.assert_not_awaited()
+
+    async def test_create_and_fetch_response_cover_the_async_lifecycle(self):
+        started = asyncio.Event()
+        finish = asyncio.Event()
+
+        async def blocking_runner(prompt, **kwargs):
+            started.set()
+            await finish.wait()
+            return completed_result(
+                task_id=kwargs["task_id"], session_id=kwargs["session_id"]
+            )
+
+        with patch(
+            "mobile_agent.agentarts_runtime.run_koophone_task",
+            new=blocking_runner,
+        ):
+            created = await self.invoke(
+                {
+                    "inputs": {
+                        "operation": "create_response",
+                        "query": "打开闹钟并设置九点闹钟",
+                    }
+                },
+                session_id="session-async",
+            )
+            self.assertEqual(created.status_code, 200)
+            response_id = created.json()["response_id"]
+            self.assertRegex(
+                response_id,
+                r"^resp_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            )
+            self.assertEqual(created.json()["status"], "in_progress")
+
+            await asyncio.wait_for(started.wait(), timeout=0.2)
+            pending = await self.invoke(
+                {
+                    "inputs": {
+                        "operation": "fetch_response",
+                        "response_id": response_id,
+                    }
+                },
+                session_id="session-async",
+            )
+            self.assertEqual(pending.status_code, 200)
+            self.assertEqual(pending.json(), {"status": "in_progress"})
+
+            finish.set()
+            for _ in range(20):
+                completed = await self.invoke(
+                    {
+                        "inputs": {
+                            "operation": "fetch_response",
+                            "response_id": response_id,
+                        }
+                    },
+                    session_id="session-async",
+                )
+                if completed.json().get("status") == "completed":
+                    break
+                await asyncio.sleep(0)
+
+        self.assertEqual(completed.status_code, 200)
+        self.assertEqual(completed.json()["status"], "completed")
+        self.assertEqual(completed.json()["result"], "任务已完成")
+        self.assertEqual(completed.json()["session_id"], "session-async")
+        self.assertEqual(completed.json()["rounds"], 2)
+
+    async def test_fetch_response_hides_unknown_or_other_session_jobs(self):
+        finish = asyncio.Event()
+
+        async def blocking_runner(prompt, **kwargs):
+            await finish.wait()
+            return completed_result(
+                task_id=kwargs["task_id"], session_id=kwargs["session_id"]
+            )
+
+        with patch(
+            "mobile_agent.agentarts_runtime.run_koophone_task",
+            new=blocking_runner,
+        ):
+            created = await self.invoke(
+                {
+                    "inputs": {
+                        "operation": "create_response",
+                        "query": "只读任务",
+                    }
+                },
+                session_id="session-owner",
+            )
+            response_id = created.json()["response_id"]
+
+            other_session = await self.invoke(
+                {
+                    "inputs": {
+                        "operation": "fetch_response",
+                        "response_id": response_id,
+                    }
+                },
+                session_id="session-other",
+            )
+            unknown = await self.invoke(
+                {
+                    "inputs": {
+                        "operation": "fetch_response",
+                        "response_id": f"resp_{'0' * 8}-{'0' * 4}-{'0' * 4}-{'0' * 4}-{'0' * 12}",
+                    }
+                },
+                session_id="session-owner",
+            )
+            finish.set()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+        self.assertEqual(other_session.status_code, 404)
+        self.assertEqual(unknown.status_code, 404)
+        self.assertEqual(other_session.json(), {"error": "response_not_found"})
+        self.assertEqual(unknown.json(), {"error": "response_not_found"})
+
+    async def test_fetch_response_returns_failed_task_as_http_200(self):
+        with patch(
+            "mobile_agent.agentarts_runtime.run_koophone_task",
+            new=AsyncMock(return_value=failed_result("step_limit")),
+        ):
+            created = await self.invoke(
+                {
+                    "inputs": {
+                        "operation": "create_response",
+                        "query": "无法完成的任务",
+                    }
+                },
+                session_id="session-failed-job",
+            )
+            response_id = created.json()["response_id"]
+            for _ in range(20):
+                fetched = await self.invoke(
+                    {
+                        "inputs": {
+                            "operation": "fetch_response",
+                            "response_id": response_id,
+                        }
+                    },
+                    session_id="session-failed-job",
+                )
+                if fetched.json().get("status") == "failed":
+                    break
+                await asyncio.sleep(0)
+
+        self.assertEqual(fetched.status_code, 200)
+        self.assertEqual(fetched.json()["status"], "failed")
+        self.assertEqual(fetched.json()["error"], "task_failed")
+        self.assertEqual(fetched.json()["terminal_reason"], "step_limit")
+
+    async def test_async_runtime_failure_keeps_the_full_fetch_contract(self):
+        with patch(
+            "mobile_agent.agentarts_runtime.run_koophone_task",
+            new=AsyncMock(side_effect=RuntimeError("private provider detail")),
+        ):
+            created = await self.invoke(
+                {
+                    "inputs": {
+                        "operation": "create_response",
+                        "query": "触发运行时失败",
+                    }
+                },
+                session_id="session-runtime-failure",
+            )
+            response_id = created.json()["response_id"]
+            for _ in range(20):
+                fetched = await self.invoke(
+                    {
+                        "inputs": {
+                            "operation": "fetch_response",
+                            "response_id": response_id,
+                        }
+                    },
+                    session_id="session-runtime-failure",
+                )
+                if fetched.json().get("status") == "failed":
+                    break
+                await asyncio.sleep(0)
+
+        body = fetched.json()
+        self.assertEqual(fetched.status_code, 200)
+        self.assertEqual(body["status"], "failed")
+        self.assertEqual(body["error"], "runtime_failed")
+        self.assertRegex(body["task_id"], r"^koophone-task-")
+        self.assertRegex(body["thread_id"], r"^koophone-thread-")
+        self.assertEqual(body["session_id"], "session-runtime-failure")
+        self.assertEqual(body["rounds"], 0)
+        self.assertEqual(body["elapsed_ms"], 0)
+        self.assertEqual(body["terminal_reason"], "runtime_failed")
+        self.assertNotIn("private provider detail", fetched.text)
+
+    async def test_background_task_does_not_inherit_gateway_request_context(self):
+        observed_context = {}
+
+        async def context_observing_runner(prompt, **kwargs):
+            observed_context["workload_access_token"] = (
+                AgentArtsRuntimeContext.get_workload_access_token()
+            )
+            observed_context["user_id"] = AgentArtsRuntimeContext.get_user_id()
+            return completed_result(
+                task_id=kwargs["task_id"], session_id=kwargs["session_id"]
+            )
+
+        with patch(
+            "mobile_agent.agentarts_runtime.run_koophone_task",
+            new=context_observing_runner,
+        ):
+            created = await self.client.post(
+                "/invocations",
+                headers={
+                    SESSION_HEADER: "session-clean-context",
+                    ACCESS_TOKEN_HEADER: "workload-token-must-not-survive",
+                    USER_ID_HEADER: "user-must-not-survive",
+                    "content-type": "application/json",
+                },
+                content=json.dumps(
+                    {
+                        "inputs": {
+                            "operation": "create_response",
+                            "query": "只读任务",
+                        }
+                    }
+                ),
+            )
+            response_id = created.json()["response_id"]
+            for _ in range(20):
+                fetched = await self.invoke(
+                    {
+                        "inputs": {
+                            "operation": "fetch_response",
+                            "response_id": response_id,
+                        }
+                    },
+                    session_id="session-clean-context",
+                )
+                if fetched.json().get("status") == "completed":
+                    break
+                await asyncio.sleep(0)
+
+        self.assertEqual(observed_context["workload_access_token"], None)
+        self.assertEqual(observed_context["user_id"], None)
+        self.assertNotIn("workload-token-must-not-survive", fetched.text)
+
+    async def test_async_response_state_is_bounded_and_expires(self):
+        now = [0.0]
+        bounded_store = InMemoryAsyncResponseStore(
+            max_records=1,
+            ttl_seconds=10,
+            clock=lambda: now[0],
+        )
+        finish = asyncio.Event()
+
+        async def blocking_runner(prompt, **kwargs):
+            await finish.wait()
+            return completed_result(
+                task_id=kwargs["task_id"], session_id=kwargs["session_id"]
+            )
+
+        with patch(
+            "mobile_agent.agentarts_runtime.async_response_store",
+            new=bounded_store,
+        ), patch(
+            "mobile_agent.agentarts_runtime.run_koophone_task",
+            new=blocking_runner,
+        ):
+            first = await self.invoke(
+                {
+                    "inputs": {
+                        "operation": "create_response",
+                        "query": "第一个任务",
+                    }
+                },
+                session_id="session-bounded",
+            )
+            second = await self.invoke(
+                {
+                    "inputs": {
+                        "operation": "create_response",
+                        "query": "第二个任务",
+                    }
+                },
+                session_id="session-bounded",
+            )
+            self.assertEqual(second.status_code, 503)
+            self.assertEqual(
+                second.json(), {"error": "response_capacity_exceeded"}
+            )
+
+            finish.set()
+            response_id = first.json()["response_id"]
+            for _ in range(20):
+                completed = await self.invoke(
+                    {
+                        "inputs": {
+                            "operation": "fetch_response",
+                            "response_id": response_id,
+                        }
+                    },
+                    session_id="session-bounded",
+                )
+                if completed.json().get("status") == "completed":
+                    break
+                await asyncio.sleep(0)
+
+            now[0] = 11.0
+            expired = await self.invoke(
+                {
+                    "inputs": {
+                        "operation": "fetch_response",
+                        "response_id": response_id,
+                    }
+                },
+                session_id="session-bounded",
+            )
+
+        self.assertEqual(expired.status_code, 404)
+        self.assertEqual(expired.json(), {"error": "response_not_found"})
 
     async def test_ping_reports_unhealthy_when_runtime_is_not_ready(self):
         runtime_health.set_ready(False)
@@ -121,7 +491,7 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
             "mobile_agent.agentarts_runtime.run_koophone_task",
             new=blocking_runner,
         ):
-            request = asyncio.create_task(self.invoke({"input": "长任务"}))
+            request = asyncio.create_task(self.chat("长任务"))
             await asyncio.wait_for(started.wait(), timeout=0.2)
 
             busy_ping = await self.client.get("/ping")
@@ -140,7 +510,7 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
         self.assertIsNotNone(lease)
 
         with patch("mobile_agent.agentarts_runtime.run_koophone_task", new=AsyncMock()) as runner:
-            response = await self.invoke({"input": "第二个任务"})
+            response = await self.chat("第二个任务")
 
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.json(), {"error": "device_busy"})
@@ -158,9 +528,9 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
         )
 
         with patch("mobile_agent.agentarts_runtime.run_koophone_task", new=runner):
-            failed = await self.invoke({"input": "失败任务"})
-            errored = await self.invoke({"input": "异常任务"})
-            recovered = await self.invoke({"input": "恢复任务"})
+            failed = await self.chat("失败任务")
+            errored = await self.chat("异常任务")
+            recovered = await self.chat("恢复任务")
 
         self.assertEqual(failed.status_code, 422)
         self.assertEqual(errored.status_code, 500)
@@ -186,8 +556,8 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
             "mobile_agent.agentarts_runtime.run_koophone_task",
             new=timeout_runner,
         ):
-            timed_out = await self.invoke({"input": "超时任务"})
-            recovered = await self.invoke({"input": "超时后任务"})
+            timed_out = await self.chat("超时任务")
+            recovered = await self.chat("超时后任务")
 
         self.assertEqual(timed_out.status_code, 504)
         self.assertEqual(timed_out.json()["error"], "task_timeout")
@@ -217,13 +587,13 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
             "mobile_agent.agentarts_runtime.run_koophone_task",
             new=cancellable_runner,
         ):
-            request = asyncio.create_task(self.invoke({"input": "取消任务"}))
+            request = asyncio.create_task(self.chat("取消任务"))
             await asyncio.wait_for(started.wait(), timeout=0.2)
             request.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await request
 
-            recovered = await self.invoke({"input": "取消后任务"})
+            recovered = await self.chat("取消后任务")
 
         self.assertTrue(cancelled.is_set())
         self.assertEqual(recovered.status_code, 200)
@@ -239,7 +609,7 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
                     "mobile_agent.agentarts_runtime.run_koophone_task",
                     new=AsyncMock(),
                 ) as runner:
-                    response = await self.invoke({"input": "任务"})
+                    response = await self.chat("任务")
 
                 self.assertEqual(response.status_code, 500)
                 self.assertEqual(response.json(), {"error": "runtime_failed"})
@@ -256,6 +626,21 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
             {"input": "x" * (MAX_INPUT_LENGTH + 1)},
             [],
             "not-an-object",
+            {"inputs": {}},
+            {"inputs": {"operation": "unknown"}},
+            {
+                "inputs": {
+                    "operation": "query_capabilities",
+                    "query": "extra",
+                }
+            },
+            {"inputs": {"operation": "create_response", "query": ""}},
+            {
+                "inputs": {
+                    "operation": "fetch_response",
+                    "response_id": "invalid",
+                }
+            },
         ]
 
         with patch("mobile_agent.agentarts_runtime.run_koophone_task", new=AsyncMock()) as runner:
@@ -266,12 +651,36 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
 
         runner.assert_not_awaited()
 
+    async def test_legacy_unwrapped_input_is_rejected(self):
+        with patch(
+            "mobile_agent.agentarts_runtime.run_koophone_task", new=AsyncMock()
+        ) as runner:
+            response = await self.client.post(
+                "/invocations",
+                headers={
+                    SESSION_HEADER: "session-test",
+                    "content-type": "application/json",
+                },
+                content=json.dumps({"input": "旧格式任务"}),
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"error": "invalid_request"})
+        runner.assert_not_awaited()
+
     async def test_missing_or_invalid_session_is_rejected_before_agent(self):
         with patch("mobile_agent.agentarts_runtime.run_koophone_task", new=AsyncMock()) as runner:
             missing = await self.client.post(
                 "/invocations",
                 headers={"content-type": "application/json"},
-                content=json.dumps({"input": "打开闹钟"}),
+                content=json.dumps(
+                    {
+                        "inputs": {
+                            "operation": "chat_completions",
+                            "query": "打开闹钟",
+                        }
+                    }
+                ),
             )
             invalid = await self.client.post(
                 "/invocations",
@@ -279,7 +688,14 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
                     SESSION_HEADER: "bad session",
                     "content-type": "application/json",
                 },
-                content=json.dumps({"input": "打开闹钟"}),
+                content=json.dumps(
+                    {
+                        "inputs": {
+                            "operation": "chat_completions",
+                            "query": "打开闹钟",
+                        }
+                    }
+                ),
             )
 
         self.assertEqual(missing.status_code, 400)
@@ -298,7 +714,7 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
 
         with patch("mobile_agent.agentarts_runtime.run_koophone_task", new=AsyncMock()) as runner:
             for session_id in invalid_ids:
-                response = await self.invoke({"input": "任务"}, session_id=session_id)
+                response = await self.chat("任务", session_id=session_id)
                 self.assertEqual(response.status_code, 400, session_id)
                 self.assertEqual(response.json(), {"error": "invalid_request"})
 
@@ -316,7 +732,11 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
         runner.assert_not_awaited()
 
     async def test_oversized_body_is_rejected_before_json_or_agent_work(self):
-        oversized = b'{"input":"' + b"x" * MAX_REQUEST_BODY_BYTES + b'"}'
+        oversized = (
+            b'{"inputs":{"operation":"chat_completions","query":"'
+            + b"x" * MAX_REQUEST_BODY_BYTES
+            + b'"}}'
+        )
 
         with patch("mobile_agent.agentarts_runtime.run_koophone_task", new=AsyncMock()) as runner:
             response = await self.client.post(
@@ -337,7 +757,15 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
         runner = AsyncMock(return_value=result)
 
         with patch("mobile_agent.agentarts_runtime.run_koophone_task", new=runner):
-            response = await self.invoke({"input": "根据会议号开启快速会议"}, session_id="session-42")
+            response = await self.invoke(
+                {
+                    "inputs": {
+                        "operation": "chat_completions",
+                        "query": "根据会议号开启快速会议",
+                    }
+                },
+                session_id="session-42",
+            )
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), result.to_dict())
@@ -361,7 +789,14 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
                     "authorization": "Bearer agentarts-inbound-key",
                     "content-type": "application/json",
                 },
-                content=json.dumps({"input": "任务"}),
+                content=json.dumps(
+                    {
+                        "inputs": {
+                            "operation": "chat_completions",
+                            "query": "任务",
+                        }
+                    }
+                ),
             )
 
         self.assertEqual(response.status_code, 200)
@@ -386,9 +821,7 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
             "mobile_agent.agentarts_runtime.run_koophone_task",
             new=AsyncMock(return_value=result),
         ):
-            response = await self.invoke(
-                {"input": f"打开 {secret}"},
-            )
+            response = await self.chat(f"打开 {secret}")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["result"], "任务已完成")
@@ -412,7 +845,7 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
             "mobile_agent.agentarts_runtime.run_koophone_task",
             new=AsyncMock(return_value=result),
         ):
-            response = await self.invoke({"input": "任务"})
+            response = await self.chat("任务")
 
         self.assertEqual(response.status_code, 200)
         body = response.json()
@@ -442,7 +875,7 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
             "mobile_agent.agentarts_runtime.run_koophone_task",
             new=AsyncMock(return_value=result),
         ):
-            response = await self.invoke({"input": "任务"})
+            response = await self.chat("任务")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["result"], "任务已完成")
@@ -456,8 +889,8 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
         runner = AsyncMock(side_effect=results)
 
         with patch("mobile_agent.agentarts_runtime.run_koophone_task", new=runner):
-            first = await self.invoke({"input": "任务一"}, session_id="session-shared")
-            second = await self.invoke({"input": "任务二"}, session_id="session-shared")
+            first = await self.chat("任务一", session_id="session-shared")
+            second = await self.chat("任务二", session_id="session-shared")
 
         self.assertEqual(first.status_code, 200)
         self.assertEqual(second.status_code, 200)
@@ -470,7 +903,7 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
             "mobile_agent.agentarts_runtime.run_koophone_task",
             new=AsyncMock(return_value=failed_result("step_limit")),
         ):
-            response = await self.invoke({"input": "任务"})
+            response = await self.chat("任务")
 
         self.assertEqual(response.status_code, 422)
         self.assertEqual(response.json()["error"], "task_failed")
@@ -488,7 +921,7 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
                 "mobile_agent.agentarts_runtime.run_koophone_task",
                 new=AsyncMock(return_value=failed_result(reason)),
             ):
-                response = await self.invoke({"input": "任务"})
+                response = await self.chat("任务")
 
             self.assertEqual(response.status_code, expected_status, reason)
             self.assertEqual(response.json()["error"], expected_error, reason)
@@ -498,7 +931,7 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
             "mobile_agent.agentarts_runtime.run_koophone_task",
             new=AsyncMock(side_effect=RuntimeError("secret-token-from-upstream")),
         ):
-            response = await self.invoke({"input": "任务"})
+            response = await self.chat("任务")
 
         self.assertEqual(response.status_code, 500)
         self.assertEqual(response.json(), {"error": "runtime_failed"})
@@ -508,7 +941,7 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
         response = await self.client.post(
             "/invocations",
             headers={SESSION_HEADER: "session-test", "content-type": "application/json"},
-            content=b'{"input": "unterminated',
+            content=b'{"inputs":{"operation":"chat_completions","query":"unterminated',
         )
 
         self.assertEqual(response.status_code, 400)
@@ -526,7 +959,7 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
         sdk_logger.addHandler(capture)
         try:
             app.handlers["main"] = exploding_handler
-            response = await self.invoke({"input": "任务"})
+            response = await self.chat("任务")
         finally:
             app.handlers["main"] = original_handler
             sdk_logger.removeHandler(capture)
@@ -554,7 +987,7 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
                 "mobile_agent.agentarts_runtime.run_koophone_task",
                 new=exploding_runner,
             ):
-                response = await self.invoke({"input": "任务"})
+                response = await self.chat("任务")
         finally:
             root_logger.removeHandler(capture)
 
@@ -576,7 +1009,7 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
                 "mobile_agent.agentarts_runtime.run_koophone_task",
                 new=AsyncMock(return_value=completed_result()),
             ):
-                response = await self.invoke({"input": prompt})
+                response = await self.chat(prompt)
         finally:
             audit_logger.removeHandler(capture)
 

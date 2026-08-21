@@ -1,19 +1,21 @@
 # Copyright (c) 2025 Bytedance Ltd. and/or its affiliates
 # Licensed under the 【火山方舟】原型应用软件自用许可协议
 
-"""Local synchronous AgentArts Runtime adapter for the KooPhone agent.
+"""AgentArts Runtime operation adapter for the KooPhone agent.
 
 The Huawei ``agentarts-sdk`` owns the runtime protocol and route layout.  This
-module only validates the local request contract, invokes the existing
-``run_koophone_task`` entry point, and maps its structured business result to a
-small synchronous JSON API.  It deliberately does not duplicate the
-MobileUseAgent graph or expose the outer Gateway ``/runtimes/...`` path.
+module validates the unified ``inputs.operation`` request contract, invokes the
+existing ``run_koophone_task`` entry point, and maps its structured business
+result to synchronous or POC in-process asynchronous responses.  It deliberately
+does not duplicate the MobileUseAgent graph or expose the outer Gateway
+``/runtimes/...`` path.
 """
 
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
+import contextvars
+from dataclasses import dataclass, replace
 import json
 import logging
 import math
@@ -22,7 +24,7 @@ import re
 import sys
 import time
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 from agentarts.sdk import AgentArtsRuntimeApp, PingStatus, RequestContext
 from agentarts.sdk.runtime.model import SESSION_HEADER
@@ -50,10 +52,17 @@ from mobile_agent.runtime.security import (
 
 MAX_INPUT_LENGTH = 4_096
 DEFAULT_TASK_TIMEOUT_SECONDS = 900.0
+DEFAULT_ASYNC_RESPONSE_TTL_SECONDS = 3_600.0
+MAX_ASYNC_RESPONSE_RECORDS = 256
 FIXED_DEVICE_SLOT = "koophone-fixed-device"
 RUNTIME_PROVIDER = "kimi"
 RUNTIME_MODEL = "kimi-k2.6"
 RUNTIME_DEVICE_PROVIDER = "koophone_mcp"
+RUNTIME_CAPABILITIES = {
+    "chat_completions": True,
+    "responses_api": True,
+    "responses_get_fetch": True,
+}
 _SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _PATH_OR_URL_PATTERN = re.compile(
     r"(?:https?://|file://|(?<![A-Za-z0-9])/(?:[A-Za-z0-9_.-]+/)+[^\s]+|"
@@ -125,6 +134,104 @@ _DEVICE_FAILURE_REASONS = frozenset(
         "operation_uncertain",
     }
 )
+_RESPONSE_ID_PATTERN = re.compile(
+    r"^resp_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+
+
+@dataclass(frozen=True)
+class InvocationCommand:
+    operation: str
+    query: str | None = None
+    response_id: str | None = None
+
+
+@dataclass(frozen=True)
+class AsyncResponseRecord:
+    session_id: str
+    payload: dict[str, object]
+    updated_at: float
+
+
+class AsyncResponseStoreFull(RuntimeError):
+    """All bounded response slots are occupied by active tasks."""
+
+
+class InMemoryAsyncResponseStore:
+    """POC-only response state scoped to one Runtime process."""
+
+    def __init__(
+        self,
+        *,
+        max_records: int = MAX_ASYNC_RESPONSE_RECORDS,
+        ttl_seconds: float = DEFAULT_ASYNC_RESPONSE_TTL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if max_records <= 0 or ttl_seconds <= 0:
+            raise ValueError("response store bounds must be positive")
+        self._records: dict[str, AsyncResponseRecord] = {}
+        self._max_records = max_records
+        self._ttl_seconds = ttl_seconds
+        self._clock = clock
+
+    def _purge_expired(self) -> None:
+        now = self._clock()
+        expired = [
+            response_id
+            for response_id, record in self._records.items()
+            if now - record.updated_at >= self._ttl_seconds
+        ]
+        for response_id in expired:
+            self._records.pop(response_id, None)
+
+    def _make_room(self) -> None:
+        self._purge_expired()
+        if len(self._records) < self._max_records:
+            return
+        completed = [
+            (record.updated_at, response_id)
+            for response_id, record in self._records.items()
+            if record.payload.get("status") != "in_progress"
+        ]
+        if not completed:
+            raise AsyncResponseStoreFull
+        _, oldest = min(completed)
+        self._records.pop(oldest, None)
+
+    def create(self, session_id: str) -> str:
+        self._make_room()
+        response_id = f"resp_{uuid.uuid4()}"
+        self._records[response_id] = AsyncResponseRecord(
+            session_id=session_id,
+            payload={"status": "in_progress"},
+            updated_at=self._clock(),
+        )
+        return response_id
+
+    def complete(
+        self,
+        response_id: str,
+        session_id: str,
+        payload: dict[str, object],
+    ) -> None:
+        current = self._records.get(response_id)
+        if current is None or current.session_id != session_id:
+            return
+        self._records[response_id] = AsyncResponseRecord(
+            session_id=session_id,
+            payload=dict(payload),
+            updated_at=self._clock(),
+        )
+
+    def fetch(self, response_id: str, session_id: str) -> dict[str, object] | None:
+        self._purge_expired()
+        record = self._records.get(response_id)
+        if record is None or record.session_id != session_id:
+            return None
+        return dict(record.payload)
+
+    def clear(self) -> None:
+        self._records.clear()
 
 
 class RuntimeHealth:
@@ -148,6 +255,8 @@ class RuntimeHealth:
 
 runtime_health = RuntimeHealth()
 device_lease_provider: DeviceLeaseProvider = InProcessDeviceLease()
+async_response_store = InMemoryAsyncResponseStore()
+_background_response_tasks: set[asyncio.Task[None]] = set()
 
 
 class RedactedInvocationErrors:
@@ -317,16 +426,44 @@ def _session_id(context: RequestContext) -> str:
     return value
 
 
-def _prompt(payload: object) -> str:
-    if not isinstance(payload, dict) or set(payload) != {"input"}:
-        raise ValueError("input must be an object with only input")
-    value = payload.get("input")
+def _query(value: object) -> str:
     if not isinstance(value, str):
-        raise ValueError("input must be a string")
+        raise ValueError("query must be a string")
     value = value.strip()
     if not value or len(value) > MAX_INPUT_LENGTH:
-        raise ValueError("input length is invalid")
+        raise ValueError("query length is invalid")
     return value
+
+
+def _response_id(value: object) -> str:
+    if not isinstance(value, str) or not _RESPONSE_ID_PATTERN.fullmatch(value):
+        raise ValueError("response_id is invalid")
+    return value
+
+
+def _invocation_command(payload: object) -> InvocationCommand:
+    if not isinstance(payload, dict) or set(payload) != {"inputs"}:
+        raise ValueError("request must contain only inputs")
+    inputs = payload.get("inputs")
+    if not isinstance(inputs, dict):
+        raise ValueError("inputs must be an object")
+    operation = inputs.get("operation")
+    if operation == "query_capabilities" and set(inputs) == {"operation"}:
+        return InvocationCommand(operation=operation)
+    if operation in {"chat_completions", "create_response"} and set(inputs) == {
+        "operation",
+        "query",
+    }:
+        return InvocationCommand(operation=operation, query=_query(inputs.get("query")))
+    if operation == "fetch_response" and set(inputs) == {
+        "operation",
+        "response_id",
+    }:
+        return InvocationCommand(
+            operation=operation,
+            response_id=_response_id(inputs.get("response_id")),
+        )
+    raise ValueError("operation contract is invalid")
 
 
 def _task_timeout_seconds() -> float:
@@ -505,18 +642,17 @@ async def _release_device_lease(lease: DeviceLeaseHandle) -> None:
         logging.getLogger(__name__).exception("Device lease release failed")
 
 
-@app.entrypoint
-async def invoke(
-    payload: object, context: RequestContext
-) -> JSONResponse | dict[str, object]:
-    """Validate one request and run one fresh KooPhone task."""
+async def _execute_prompt(
+    prompt: str,
+    session_id: str,
+    *,
+    task_id: str | None = None,
+    thread_id: str | None = None,
+) -> JSONResponse:
+    """Run one KooPhone task and preserve the synchronous response contract."""
 
-    try:
-        prompt = _prompt(payload)
-        session_id = _session_id(context)
-    except (TypeError, ValueError):
-        return _error("invalid_request", status_code=400)
-
+    if task_id is None or thread_id is None:
+        task_id, thread_id = _new_task_ids()
     try:
         task_timeout = _task_timeout_seconds()
     except ValueError:
@@ -528,7 +664,6 @@ async def invoke(
         )
         return _error("runtime_failed", status_code=500)
 
-    task_id, thread_id = _new_task_ids()
     lease: DeviceLeaseHandle | None = None
     try:
         try:
@@ -672,11 +807,172 @@ async def invoke(
                 runtime_health.set_busy(False)
 
 
+def _json_response_payload(
+    response: JSONResponse,
+    *,
+    task_id: str,
+    thread_id: str,
+    session_id: str,
+) -> dict[str, object]:
+    try:
+        payload = json.loads(response.body)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = {"error": "runtime_failed"}
+    if not isinstance(payload, dict):
+        payload = {"error": "runtime_failed"}
+    if payload.get("status") == "completed":
+        return payload
+    return {
+        **payload,
+        "status": "failed",
+        "task_id": _runtime_identifier(
+            payload.get("task_id"), fallback=task_id
+        ),
+        "thread_id": _runtime_identifier(
+            payload.get("thread_id"), fallback=thread_id
+        ),
+        "session_id": _runtime_identifier(
+            payload.get("session_id"), fallback=session_id
+        ),
+        "rounds": max(0, int(payload.get("rounds", 0))),
+        "elapsed_ms": max(0, int(payload.get("elapsed_ms", 0))),
+        "terminal_reason": _runtime_terminal_reason(
+            payload.get("terminal_reason")
+        ),
+    }
+
+
+@app.async_task
+async def _run_async_response(
+    response_id: str,
+    prompt: str,
+    session_id: str,
+    task_id: str,
+    thread_id: str,
+) -> None:
+    try:
+        response = await _execute_prompt(
+            prompt,
+            session_id,
+            task_id=task_id,
+            thread_id=thread_id,
+        )
+        payload = _json_response_payload(
+            response,
+            task_id=task_id,
+            thread_id=thread_id,
+            session_id=session_id,
+        )
+    except asyncio.CancelledError:
+        async_response_store.complete(
+            response_id,
+            session_id,
+            {
+                "status": "failed",
+                "error": "task_cancelled",
+                "task_id": task_id,
+                "thread_id": thread_id,
+                "session_id": session_id,
+                "rounds": 0,
+                "elapsed_ms": 0,
+                "terminal_reason": "cancelled",
+            },
+        )
+        raise
+    except Exception:
+        payload = {
+            "status": "failed",
+            "error": "runtime_failed",
+            "task_id": task_id,
+            "thread_id": thread_id,
+            "session_id": session_id,
+            "rounds": 0,
+            "elapsed_ms": 0,
+            "terminal_reason": "runtime_failed",
+        }
+    async_response_store.complete(response_id, session_id, payload)
+
+
+def _retain_background_task(task: asyncio.Task[None]) -> None:
+    _background_response_tasks.add(task)
+
+    def completed(done: asyncio.Task[None]) -> None:
+        _background_response_tasks.discard(done)
+        try:
+            done.exception()
+        except asyncio.CancelledError:
+            pass
+
+    task.add_done_callback(completed)
+
+
+@app.entrypoint
+async def invoke(
+    payload: object, context: RequestContext
+) -> JSONResponse | dict[str, object]:
+    """Dispatch the unified AgentArts operation contract."""
+
+    try:
+        command = _invocation_command(payload)
+    except (TypeError, ValueError):
+        return _error("invalid_request", status_code=400)
+
+    if command.operation == "query_capabilities":
+        return {"capabilities": dict(RUNTIME_CAPABILITIES)}
+
+    try:
+        session_id = _session_id(context)
+    except (TypeError, ValueError):
+        return _error("invalid_request", status_code=400)
+
+    if command.operation == "chat_completions":
+        assert command.query is not None
+        return await _execute_prompt(command.query, session_id)
+
+    if command.operation == "create_response":
+        assert command.query is not None
+        try:
+            response_id = async_response_store.create(session_id)
+        except AsyncResponseStoreFull:
+            return _error("response_capacity_exceeded", status_code=503)
+        task_id, thread_id = _new_task_ids()
+        task = asyncio.create_task(
+            _run_async_response(
+                response_id,
+                command.query,
+                session_id,
+                task_id,
+                thread_id,
+            ),
+            context=contextvars.Context(),
+        )
+        _retain_background_task(task)
+        return JSONResponse(
+            status_code=200,
+            content={"response_id": response_id, "status": "in_progress"},
+            headers={SESSION_HEADER: session_id},
+        )
+
+    assert command.operation == "fetch_response"
+    assert command.response_id is not None
+    stored = async_response_store.fetch(command.response_id, session_id)
+    if stored is None:
+        return _error("response_not_found", status_code=404)
+    return JSONResponse(
+        status_code=200,
+        content=stored,
+        headers={SESSION_HEADER: session_id},
+    )
+
+
 @app.ping
 def ping() -> PingStatus:
     """Return SDK wire-format health without touching model/device services."""
 
-    return runtime_health.status()
+    status = runtime_health.status()
+    if status == PingStatus.HEALTHY and app.has_running_tasks():
+        return PingStatus.HEALTHY_BUSY
+    return status
 
 
 def _port_from_environment() -> int:

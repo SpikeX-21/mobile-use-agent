@@ -43,14 +43,20 @@ from mobile_agent import agentarts_deploy_cli
 
 class AgentArtsDeploymentTests(unittest.TestCase):
     def test_defaults_match_the_approved_internal_poc(self):
-        self.assertEqual(AGENT_NAME, "mobile-use-koophone-poc")
+        self.assertEqual(AGENT_NAME, "mobile-use-koophone-poc-test1")
         self.assertEqual(ENTRYPOINT, "app:app")
         self.assertEqual(REGION, "cn-southwest-2")
         self.assertEqual(DEPENDENCY_FILE, "requirements.txt")
         self.assertEqual(ENDPOINT_NAME, "dev")
         self.assertEqual(
             default_swr_repository(AGENT_NAME),
-            "agent_mobile-use-koophone-poc",
+            "agent_mobile-use-koophone-poc-test1",
+        )
+        self.assertEqual(
+            agentarts_deploy_cli.STATE_DIRECTORY,
+            agentarts_deploy_cli.COMPONENT_ROOT
+            / ".agentarts"
+            / "mobile-use-koophone-poc-test1",
         )
         self.assertRegex(
             default_swr_organization("test-access-key"),
