@@ -21,11 +21,17 @@ FROM python:3.11.13-slim-bookworm
 
 LABEL org.opencontainers.image.title="mobile-use KooPhone AgentArts Runtime" \
       org.opencontainers.image.description="secret-bearing internal POC; never publish or use in production" \
-      com.mobile-use.security.secret-bearing="true"
+      com.mobile-use.security.secret-bearing="true" \
+      com.mobile-use.runtime.kind="agentarts" \
+      com.mobile-use.target.platform="linux/arm64" \
+      com.mobile-use.release.channel="internal-poc"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH="/opt/mobile-agent/.venv/bin:${PATH}" \
+    HOME=/tmp/mobile-agent-home \
+    TMPDIR=/tmp \
+    XDG_CACHE_HOME=/tmp/mobile-agent-cache \
     AGENT_RUN_PORT=8080 \
     MOBILE_CONFIG_PATH=/opt/mobile-agent/config.toml \
     KOOPHONE_JKS_PATH=/opt/mobile-agent/secrets/koophone.jks \
@@ -46,5 +52,7 @@ RUN test -s /opt/mobile-agent/secrets/koophone.jks
 EXPOSE 8080
 
 USER 10001:10001
+
+STOPSIGNAL SIGTERM
 
 ENTRYPOINT ["python", "-m", "mobile_agent.agentarts_runtime"]
