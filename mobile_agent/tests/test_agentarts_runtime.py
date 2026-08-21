@@ -24,6 +24,7 @@ from mobile_agent.agentarts_runtime import (
     FIXED_DEVICE_SLOT,
     main,
     runtime_health,
+    RuntimeAuditStdoutHandler,
 )
 from mobile_agent.runtime.device_lease import InProcessDeviceLease
 from mobile_agent.runtime.security import RuntimeConfigurationError
@@ -587,6 +588,21 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
         self.assertNotIn(prompt, output)
         self.assertNotIn("sk-123456789012345678901234", output)
         self.assertNotIn("instanceId", output)
+
+    def test_runtime_audit_has_one_dedicated_stdout_handler(self):
+        configure_runtime_logging()
+        configure_runtime_logging()
+
+        audit_logger = logging.getLogger("agentarts.runtime.audit")
+        handlers = [
+            handler
+            for handler in audit_logger.handlers
+            if isinstance(handler, RuntimeAuditStdoutHandler)
+        ]
+
+        self.assertEqual(len(handlers), 1)
+        self.assertEqual(handlers[0].level, logging.INFO)
+        self.assertFalse(audit_logger.propagate)
 
     def test_main_fails_before_serving_when_local_configuration_is_invalid(self):
         with patch(

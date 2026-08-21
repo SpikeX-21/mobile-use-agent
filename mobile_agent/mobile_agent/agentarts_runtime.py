@@ -19,6 +19,7 @@ import logging
 import math
 import os
 import re
+import sys
 import time
 import uuid
 from typing import Any
@@ -221,6 +222,24 @@ class RedactedRuntimeLogFilter(logging.Filter):
         return True
 
 
+class RuntimeAuditStdoutHandler(logging.StreamHandler):
+    """Dedicated stdout sink for the already allowlisted Runtime audit event."""
+
+
+def _install_runtime_audit_handler() -> None:
+    """Keep audit INFO events visible after the AgentArts SDK configures logging."""
+
+    if not any(
+        isinstance(handler, RuntimeAuditStdoutHandler)
+        for handler in _RUNTIME_AUDIT_LOGGER.handlers
+    ):
+        handler = RuntimeAuditStdoutHandler(sys.stdout)
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        _RUNTIME_AUDIT_LOGGER.addHandler(handler)
+    _RUNTIME_AUDIT_LOGGER.propagate = False
+
+
 app = AgentArtsRuntimeApp(
     middleware=[
         Middleware(InvocationRequestGuard),
@@ -257,8 +276,10 @@ def configure_runtime_logging() -> None:
     for logger_name in ("httpx", "httpcore", "mcp.client.streamable_http"):
         logging.getLogger(logger_name).setLevel(logging.WARNING)
     logging.getLogger().setLevel(logging.WARNING)
-    # The SDK installs a handler on its ``agentarts`` parent logger. Keep the
-    # audit event from being emitted once by that handler and once by root.
+    # The SDK may later replace or raise the level of its parent handlers.
+    # Give the allowlisted audit event a dedicated stdout sink instead of
+    # relying on propagation through that mutable logging hierarchy.
+    _install_runtime_audit_handler()
     logging.getLogger("agentarts").propagate = False
     for logger_name in (
         "agentarts.runtime.app",
