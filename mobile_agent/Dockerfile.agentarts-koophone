@@ -3,18 +3,30 @@ FROM python:3.11.13-slim-bookworm AS builder
 
 WORKDIR /opt/mobile-agent
 
-RUN apt-get update \
+# Keep the build reproducible and avoid depending on the slow public PyPI
+# route in restricted build environments. The audited AgentArts package keeps
+# using its explicit Huawei index from pyproject.toml/uv.lock.
+ARG UV_PACKAGE_BASE=https://repo.huaweicloud.com/repository/pypi
+ARG UV_DEFAULT_INDEX=https://repo.huaweicloud.com/repository/pypi/simple
+
+# Use the Huawei Debian mirror for the ARM64 build layer as well; the public
+# Debian route is intermittently unreachable from restricted build networks.
+RUN sed -i 's|deb.debian.org|repo.huaweicloud.com|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
     && apt-get install --yes --no-install-recommends gcc libc6-dev \
-    && python -m pip install --no-cache-dir uv==0.8.11 \
+    && PIP_INDEX_URL="$UV_DEFAULT_INDEX" python -m pip install --no-cache-dir uv==0.8.11 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml uv.lock README.md ./
-RUN uv sync --frozen --no-dev --no-install-project
+RUN sed -i "s|https://files.pythonhosted.org|${UV_PACKAGE_BASE}|g" uv.lock \
+    && uv sync --frozen --no-dev --no-install-project \
+    --default-index "$UV_DEFAULT_INDEX"
 
 COPY mobile_agent ./mobile_agent
 RUN find mobile_agent -type f ! -name '*.py' -delete \
     && test -z "$(find mobile_agent -type f ! -name '*.py' -print -quit)" \
     && uv sync --frozen --no-dev --no-editable \
+        --default-index "$UV_DEFAULT_INDEX" \
     && rm -rf /root/.cache /tmp/*
 
 FROM python:3.11.13-slim-bookworm

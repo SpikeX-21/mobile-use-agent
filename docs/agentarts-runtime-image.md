@@ -21,7 +21,11 @@
 
 华为高码开发要求使用 Linux ARM64 制作镜像，并说明 SWR 基础版不支持 OCI 镜像
 格式；Docker 27+ 可设置 `BUILDKIT_USE_OCI_MEDIA_TYPES=0`（或关闭 BuildKit）。
-本项目保留 BuildKit 是因为 Dockerfile 使用 `COPY --chmod`，构建脚本显式设置前者：
+本项目保留 BuildKit 是因为 Dockerfile 使用 `COPY --chmod`，构建脚本同时设置兼容环境变量，
+并显式使用 `--output type=image,...,oci-mediatypes=false`，因为 Docker Desktop 的本地
+containerd 镜像存储可能忽略环境变量。构建阶段还将冻结锁文件中的公共 PyPI 下载直链
+临时映射到华为 PyPI 镜像（版本、哈希和仓库内 `uv.lock` 均不变），以避免 ARM64
+构建网络超时：
 [快速开始](https://support.huaweicloud.com/highcode-agentarts/agentarts_10_040.html)。
 
 ## 构建与检查

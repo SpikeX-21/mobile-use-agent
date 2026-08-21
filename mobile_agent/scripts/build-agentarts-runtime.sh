@@ -34,6 +34,7 @@ docker build \
   --platform "$TARGET_PLATFORM" \
   --provenance=false \
   --sbom=false \
+  --output "type=image,name=$IMAGE_REF,push=false,oci-mediatypes=false" \
   --file "$CONTEXT_DIR/Dockerfile.agentarts-koophone" \
   --tag "$IMAGE_REF" \
   "$CONTEXT_DIR"

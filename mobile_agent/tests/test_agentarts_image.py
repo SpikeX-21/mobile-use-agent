@@ -11,6 +11,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -20,6 +21,7 @@ COMPONENT_ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = COMPONENT_ROOT / "Dockerfile.agentarts-koophone"
 DOCKERIGNORE = COMPONENT_ROOT / ".dockerignore"
 SCRIPTS_ROOT = COMPONENT_ROOT / "scripts"
+LOCAL_HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 class AgentArtsImageDefinitionTests(unittest.TestCase):
@@ -93,6 +95,7 @@ class AgentArtsImageWorkflowTests(unittest.TestCase):
         self.assertIn("docker build", build)
         self.assertIn("--provenance=false", build)
         self.assertIn("--sbom=false", build)
+        self.assertIn("oci-mediatypes=false", build)
         self.assertIn("docker image inspect", build)
         self.assertIn("agentarts-sdk", build)
 
@@ -176,7 +179,6 @@ async def run_koophone_task(prompt, *, task_id, thread_id, session_id, **kwargs)
                 "docker",
                 "run",
                 "--detach",
-                "--rm",
                 "--name",
                 container_name,
                 "--platform",
@@ -184,7 +186,10 @@ async def run_koophone_task(prompt, *, task_id, thread_id, session_id, **kwargs)
                 "--publish",
                 "18080:8080",
                 "--mount",
-                f"type=bind,src={fake_path},dst=/opt/mobile-agent/mobile_agent/koophone_task.py,readonly",
+                "type=bind,"
+                f"src={fake_path},"
+                "dst=/opt/mobile-agent/.venv/lib/python3.11/site-packages/"
+                "mobile_agent/koophone_task.py,readonly",
                 "--env",
                 "ENV=production",
                 "--env",
@@ -242,13 +247,25 @@ async def run_koophone_task(prompt, *, task_id, thread_id, session_id, **kwargs)
                 request = urllib.request.Request("http://127.0.0.1:18080/ping")
                 for _ in range(40):
                     try:
-                        with urllib.request.urlopen(request, timeout=0.5) as response:
+                        with LOCAL_HTTP.open(request, timeout=0.5) as response:
                             if response.status == 200:
                                 break
                     except (OSError, urllib.error.HTTPError):
-                        pass
+                        time.sleep(0.05)
                 else:
-                    self.fail("container did not become healthy")
+                    logs = subprocess.run(
+                        ["docker", "logs", container_name],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.fail(
+                        "container did not become healthy: "
+                        + repr(started.stdout[-1000:])
+                        + repr(started.stderr[-1000:])
+                        + logs.stdout[-2000:]
+                        + logs.stderr[-2000:]
+                    )
 
                 def invoke(prompt: str) -> tuple[int, dict[str, object]]:
                     body = json.dumps({"input": prompt}).encode()
@@ -261,7 +278,7 @@ async def run_koophone_task(prompt, *, task_id, thread_id, session_id, **kwargs)
                         },
                     )
                     try:
-                        with urllib.request.urlopen(request, timeout=5) as response:
+                        with LOCAL_HTTP.open(request, timeout=5) as response:
                             return response.status, json.loads(response.read())
                     except urllib.error.HTTPError as error:
                         return error.code, json.loads(error.read())
