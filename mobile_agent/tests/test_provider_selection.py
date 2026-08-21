@@ -110,6 +110,8 @@ class ProviderSelectionTests(unittest.TestCase):
 
     def test_file_configuration_cannot_supply_koophone_secrets(self):
         settings = Settings(
+            kimi_api_key="env-kimi-secret",
+            adb_vendor_keys="env-adb-key-path",
             koophone_iam_password="env-iam-secret",
             koophone_jks_store_password="env-store-secret",
             koophone_jks_key_password="env-key-secret",
@@ -117,13 +119,21 @@ class ProviderSelectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
             path.write_text(
-                '{"koophone_iam_password":"file-iam-secret",'
+                '{"kimi_api_key":"file-kimi-secret",'
+                '"adb_vendor_keys":"file-adb-key-path",'
+                '"koophone_iam_password":"file-iam-secret",'
                 '"koophone_jks_store_password":"file-store-secret",'
                 '"koophone_jks_key_password":"file-key-secret"}',
                 encoding="utf-8",
             )
             settings.load_from_file(str(path))
 
+        self.assertEqual(
+            settings.kimi_api_key.get_secret_value(), "env-kimi-secret"
+        )
+        self.assertEqual(
+            settings.adb_vendor_keys.get_secret_value(), "env-adb-key-path"
+        )
         self.assertEqual(
             settings.koophone_iam_password.get_secret_value(), "env-iam-secret"
         )

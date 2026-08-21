@@ -17,6 +17,7 @@ from agentarts.sdk.runtime.model import SESSION_HEADER
 
 from mobile_agent.agent.run_result import AgentRunResult
 from mobile_agent.agentarts_runtime import (
+    MAX_REQUEST_BODY_BYTES,
     MAX_INPUT_LENGTH,
     app,
     configure_runtime_logging,
@@ -25,6 +26,7 @@ from mobile_agent.agentarts_runtime import (
     runtime_health,
 )
 from mobile_agent.runtime.device_lease import InProcessDeviceLease
+from mobile_agent.runtime.security import RuntimeConfigurationError
 
 
 def completed_result(*, task_id: str = "task-1", session_id: str = "session-1") -> AgentRunResult:
@@ -75,10 +77,16 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
         runtime_health.set_ready(True)
         runtime_health.set_busy(False)
 
-    async def invoke(self, payload: object, *, session_id: str = "session-test") -> httpx.Response:
+    async def invoke(
+        self,
+        payload: object,
+        *,
+        session_id: str = "session-test",
+        content_type: str = "application/json",
+    ) -> httpx.Response:
         return await self.client.post(
             "/invocations",
-            headers={SESSION_HEADER: session_id},
+            headers={SESSION_HEADER: session_id, "content-type": content_type},
             content=json.dumps(payload),
         )
 
@@ -261,11 +269,15 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
         with patch("mobile_agent.agentarts_runtime.run_koophone_task", new=AsyncMock()) as runner:
             missing = await self.client.post(
                 "/invocations",
+                headers={"content-type": "application/json"},
                 content=json.dumps({"input": "打开闹钟"}),
             )
             invalid = await self.client.post(
                 "/invocations",
-                headers={SESSION_HEADER: "bad session"},
+                headers={
+                    SESSION_HEADER: "bad session",
+                    "content-type": "application/json",
+                },
                 content=json.dumps({"input": "打开闹钟"}),
             )
 
@@ -273,6 +285,50 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
         self.assertEqual(invalid.status_code, 400)
         self.assertEqual(missing.json(), {"error": "invalid_request"})
         self.assertEqual(invalid.json(), {"error": "invalid_request"})
+        runner.assert_not_awaited()
+
+    async def test_session_id_rejects_unsupported_punctuation_and_credential_shapes(self):
+        invalid_ids = (
+            "session.with.dot",
+            "session:with-colon",
+            "sk-123456789012345678901234",
+            "eyJheader.eyJpayload.signature",
+        )
+
+        with patch("mobile_agent.agentarts_runtime.run_koophone_task", new=AsyncMock()) as runner:
+            for session_id in invalid_ids:
+                response = await self.invoke({"input": "任务"}, session_id=session_id)
+                self.assertEqual(response.status_code, 400, session_id)
+                self.assertEqual(response.json(), {"error": "invalid_request"})
+
+        runner.assert_not_awaited()
+
+    async def test_invocation_requires_json_content_type(self):
+        with patch("mobile_agent.agentarts_runtime.run_koophone_task", new=AsyncMock()) as runner:
+            response = await self.invoke(
+                {"input": "任务"},
+                content_type="text/plain",
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"error": "invalid_request"})
+        runner.assert_not_awaited()
+
+    async def test_oversized_body_is_rejected_before_json_or_agent_work(self):
+        oversized = b'{"input":"' + b"x" * MAX_REQUEST_BODY_BYTES + b'"}'
+
+        with patch("mobile_agent.agentarts_runtime.run_koophone_task", new=AsyncMock()) as runner:
+            response = await self.client.post(
+                "/invocations",
+                headers={
+                    SESSION_HEADER: "session-test",
+                    "content-type": "application/json",
+                },
+                content=oversized,
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"error": "invalid_request"})
         runner.assert_not_awaited()
 
     async def test_valid_request_returns_structured_success_and_forwards_context_session(self):
@@ -292,6 +348,104 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
         self.assertTrue(call.kwargs["task_id"].startswith("koophone-task-"))
         self.assertTrue(call.kwargs["thread_id"].startswith("koophone-thread-"))
         self.assertTrue(call.kwargs["propagate_cancellation"])
+
+    async def test_inbound_authorization_is_not_forwarded_to_the_agent(self):
+        runner = AsyncMock(return_value=completed_result())
+
+        with patch("mobile_agent.agentarts_runtime.run_koophone_task", new=runner):
+            response = await self.client.post(
+                "/invocations",
+                headers={
+                    SESSION_HEADER: "session-test",
+                    "authorization": "Bearer agentarts-inbound-key",
+                    "content-type": "application/json",
+                },
+                content=json.dumps({"input": "任务"}),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("agentarts-inbound-key", response.text)
+        self.assertNotIn("authorization", runner.await_args.kwargs)
+        self.assertNotIn("workload_access_token", runner.await_args.kwargs)
+
+    async def test_runtime_result_does_not_echo_prompt_or_configured_secret(self):
+        secret = "instance-secret-eid"
+        result = AgentRunResult(
+            status="completed",
+            task_id="task-safe",
+            thread_id="thread-safe",
+            session_id=secret,
+            result=f"instance={secret}; prompt=打开 {secret}",
+            rounds=1,
+            elapsed_ms=1,
+            terminal_reason="completed",
+        )
+
+        with patch.dict(os.environ, {"KOOPHONE_INSTANCE_ID": secret}), patch(
+            "mobile_agent.agentarts_runtime.run_koophone_task",
+            new=AsyncMock(return_value=result),
+        ):
+            response = await self.invoke(
+                {"input": f"打开 {secret}"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["result"], "任务已完成")
+        self.assertEqual(response.json()["session_id"], "session-unknown")
+        self.assertEqual(response.headers[SESSION_HEADER], "session-test")
+        self.assertNotIn(secret, response.text)
+
+    async def test_runtime_result_does_not_echo_raw_model_trace_or_untrusted_ids(self):
+        result = AgentRunResult(
+            status="completed",
+            task_id="/home/runtime/private/task.json",
+            thread_id="https://internal.example/trace",
+            session_id="session-safe",
+            result='{"action":{"type":"tap"},"analysis":"private trace"}',
+            rounds=1,
+            elapsed_ms=1,
+            terminal_reason="completed",
+        )
+
+        with patch(
+            "mobile_agent.agentarts_runtime.run_koophone_task",
+            new=AsyncMock(return_value=result),
+        ):
+            response = await self.invoke({"input": "任务"})
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["result"], "任务已完成")
+        self.assertEqual(body["task_id"], "task-unknown")
+        self.assertEqual(body["thread_id"], "thread-unknown")
+        self.assertNotIn("/home/runtime", response.text)
+        self.assertNotIn("internal.example", response.text)
+        self.assertNotIn("analysis", response.text)
+
+    async def test_runtime_result_does_not_echo_data_urls_or_bare_base64_images(self):
+        result = AgentRunResult(
+            status="completed",
+            task_id="task-safe",
+            thread_id="thread-safe",
+            session_id="session-safe",
+            result=(
+                "data:application/octet-stream;base64,"
+                "iVBORw0KGgoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            ),
+            rounds=1,
+            elapsed_ms=1,
+            terminal_reason="completed",
+        )
+
+        with patch(
+            "mobile_agent.agentarts_runtime.run_koophone_task",
+            new=AsyncMock(return_value=result),
+        ):
+            response = await self.invoke({"input": "任务"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["result"], "任务已完成")
+        self.assertNotIn("iVBORw0KGgo", response.text)
 
     async def test_repeated_session_id_starts_independent_tasks(self):
         results = [
@@ -409,16 +563,67 @@ class AgentArtsRuntimeTests(IsolatedAsyncioTestCase):
         self.assertNotIn("Traceback", stream.getvalue())
         self.assertIn("AgentArts runtime internal error", stream.getvalue())
 
+    async def test_runtime_stdout_event_is_allowlisted_and_does_not_include_prompt(self):
+        stream = StringIO()
+        capture = logging.StreamHandler(stream)
+        audit_logger = logging.getLogger("agentarts.runtime.audit")
+        audit_logger.addHandler(capture)
+        prompt = "执行任务，不要输出 sk-123456789012345678901234"
+        try:
+            configure_runtime_logging()
+            with patch(
+                "mobile_agent.agentarts_runtime.run_koophone_task",
+                new=AsyncMock(return_value=completed_result()),
+            ):
+                response = await self.invoke({"input": prompt})
+        finally:
+            audit_logger.removeHandler(capture)
+
+        self.assertEqual(response.status_code, 200)
+        output = stream.getvalue()
+        self.assertIn('"event":"runtime_invocation"', output)
+        self.assertIn('"provider":"kimi"', output)
+        self.assertIn('"model":"kimi-k2.6"', output)
+        self.assertNotIn(prompt, output)
+        self.assertNotIn("sk-123456789012345678901234", output)
+        self.assertNotIn("instanceId", output)
+
+    def test_main_fails_before_serving_when_local_configuration_is_invalid(self):
+        with patch(
+            "mobile_agent.agentarts_runtime.validate_runtime_configuration",
+            side_effect=RuntimeConfigurationError("KOOPHONE_JKS_PATH"),
+        ), patch.object(app, "run") as run:
+            with self.assertRaises(SystemExit) as raised:
+                main()
+
+        self.assertEqual(raised.exception.code, 2)
+        run.assert_not_called()
+
+    def test_main_rejects_invalid_runtime_port_without_raw_exception(self):
+        with patch.dict(os.environ, {"AGENT_RUN_PORT": "not-a-port"}), patch(
+            "mobile_agent.agentarts_runtime.validate_runtime_configuration"
+        ), patch.object(app, "run") as run:
+            with self.assertRaises(SystemExit) as raised:
+                main()
+
+        self.assertEqual(raised.exception.code, 2)
+        run.assert_not_called()
+
     async def test_main_binds_all_interfaces_and_reads_port(self):
         with patch.dict(os.environ, {"AGENT_RUN_PORT": "9091"}, clear=False), patch.object(
             app, "run"
-        ) as run:
+        ) as run, patch(
+            "mobile_agent.agentarts_runtime.validate_runtime_configuration"
+        ) as validate:
             main()
 
-        run.assert_called_once_with(host="0.0.0.0", port=9091)
+        run.assert_called_once_with(host="0.0.0.0", port=9091, access_log=False)
+        validate.assert_called_once()
 
     async def test_main_defaults_to_port_8080(self):
-        with patch.dict(os.environ, {}, clear=True), patch.object(app, "run") as run:
+        with patch.dict(os.environ, {}, clear=True), patch.object(app, "run") as run, patch(
+            "mobile_agent.agentarts_runtime.validate_runtime_configuration"
+        ):
             main()
 
-        run.assert_called_once_with(host="0.0.0.0", port=8080)
+        run.assert_called_once_with(host="0.0.0.0", port=8080, access_log=False)

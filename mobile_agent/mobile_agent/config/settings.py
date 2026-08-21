@@ -43,6 +43,8 @@ MOBILE_USE_MCP_NAME = "mobile"
 
 FILE_CONFIG_FORBIDDEN_SECRET_FIELDS = frozenset(
     {
+        "kimi_api_key",
+        "adb_vendor_keys",
         "koophone_iam_password",
         "koophone_jks_store_password",
         "koophone_jks_key_password",
@@ -396,7 +398,7 @@ class Settings(BaseSettings):
         file_path = config_file or self.config_path
 
         if not file_path:
-            logger.info("No config file specified, using default settings")
+            logger.debug("No config file specified; using default settings")
             return self
 
         file_path = Path(file_path)
@@ -404,7 +406,7 @@ class Settings(BaseSettings):
             file_path = ROOT_DIR / file_path
 
         if not file_path.exists():
-            logger.warning(f"Config file {file_path} not found, using default settings")
+            logger.debug("Config file is not available; using default settings")
             return self
 
         try:
@@ -415,7 +417,7 @@ class Settings(BaseSettings):
                 with open(file_path, "rb") as f:
                     config_data = tomli.load(f)
             else:
-                logger.error(f"Unsupported config file format: {file_path.suffix}")
+                logger.debug("Unsupported config file format")
                 return self
 
                 # 新增：替换环境变量
@@ -423,7 +425,7 @@ class Settings(BaseSettings):
                 config_data
             )
             if forbidden_keys:
-                logger.warning(
+                logger.debug(
                     "Ignored environment-only secret fields in file configuration: %s",
                     ", ".join(sorted(forbidden_keys)),
                 )
@@ -448,11 +450,11 @@ class Settings(BaseSettings):
                     else:
                         setattr(self, key, value)
 
-            logger.info(f"Loaded config from {file_path}")
-        except (json.JSONDecodeError, tomli.TOMLDecodeError, ValidationError) as e:
-            logger.error(f"Failed to load config from {file_path}: {e}")
-        except Exception as e:
-            logger.exception(f"Unexpected error when loading config: {e}")
+            logger.debug("Loaded runtime configuration")
+        except (json.JSONDecodeError, tomli.TOMLDecodeError, ValidationError):
+            logger.debug("Runtime configuration could not be parsed")
+        except Exception:
+            logger.debug("Runtime configuration could not be loaded")
 
         return self
 

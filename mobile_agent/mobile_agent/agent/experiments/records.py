@@ -73,6 +73,17 @@ _SECRET_VALUE_PATTERNS = (
         r"[A-Za-z0-9_-]{8,}\b"
     ),
 )
+_DATA_URL_PATTERN = re.compile(r"\bdata:[^,\s]{1,128},[^\s]+", re.IGNORECASE)
+_BARE_BASE64_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9+/_=-])"
+    r"(?:[A-Za-z0-9+/_-]{4}){16,}={0,2}"
+    r"(?![A-Za-z0-9+/_=-])"
+)
+_PRIVATE_PATH_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])/(?:[A-Za-z0-9_.-]+/)+[^\s]+|"
+    r"\.(?:env|jks|jsonl?|key|pem)\b",
+    re.IGNORECASE,
+)
 
 
 def _is_sensitive_key(key: object) -> bool:
@@ -96,14 +107,24 @@ def contains_sensitive_text(value: str) -> bool:
     if any(
         marker in lowered
         for marker in (
-            "data:image/",
             "hidden_thinking",
             "hidden_reasoning",
             "chain_of_thought",
         )
     ):
         return True
-    if re.search(r"(?im)^\s*(?:proxy-)?authorization\s*[:=]", value):
+    if (
+        _DATA_URL_PATTERN.search(value)
+        or _BARE_BASE64_PATTERN.search(value)
+        or _PRIVATE_PATH_PATTERN.search(value)
+    ):
+        return True
+    if re.search(
+        r"(?im)^\s*(?:proxy-)?(?:authorization|x-auth-token|x-subject-token|"
+        r"x-hw-agentgateway-workload-access-token|x-api-key|api-key|cookie|"
+        r"set-cookie)\s*[:=]",
+        value,
+    ):
         return True
     if any(pattern.search(value) for pattern in _SECRET_VALUE_PATTERNS):
         return True
