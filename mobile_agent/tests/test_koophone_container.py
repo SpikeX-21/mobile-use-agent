@@ -102,6 +102,7 @@ class KooPhoneContainerDefinitionTests(unittest.TestCase):
         component_root = Path(__file__).resolve().parents[1]
         dockerignore = (component_root / ".dockerignore").read_text()
         dockerfile = (component_root / "Dockerfile.koophone-poc").read_text()
+        runtime_dockerfile = (component_root / "Dockerfile.agentarts-koophone").read_text()
 
         self.assertIn("*", dockerignore.splitlines())
         self.assertIn("!config.toml", dockerignore.splitlines())
@@ -118,6 +119,14 @@ class KooPhoneContainerDefinitionTests(unittest.TestCase):
         self.assertIn(
             "find mobile_agent -type f ! -name '*.py' -delete", dockerfile
         )
+        self.assertIn("EXPOSE 8080", runtime_dockerfile)
+        self.assertIn("AGENT_RUN_PORT=8080", runtime_dockerfile)
+        self.assertIn(
+            'ENTRYPOINT ["python", "-m", "mobile_agent.agentarts_runtime"]',
+            runtime_dockerfile,
+        )
+        self.assertIn("USER 10001:10001", runtime_dockerfile)
+        self.assertIn("--chmod=0400", runtime_dockerfile)
 
 
 if __name__ == "__main__":
